@@ -17,7 +17,7 @@ function preview(canRebindTiming = true, liveEdits?: PreviewLiveEdits) {
     projectId: 'p', compositionPath: 'index.html', sourceVersions: { 'index.html': sha(1), 'scenes/intro.html': sha(3) }, studioOrigin: 'https://studio.test', canRebindTiming, liveEdits,
   }));
   Object.defineProperty(document, 'currentScript', { value: script });
-  const replies: { result?: unknown }[] = [];
+  const replies: { result?: unknown; type?: string; timelineVersion?: string }[] = [];
   const parent = { postMessage: (reply: typeof replies[number]) => replies.push(reply) };
   const hooks: string[] = [];
   const player = { getTime: () => 4, isPlaying: () => true, seek: (time: number) => hooks.push('seek:' + time), play: () => hooks.push('play') };
@@ -35,7 +35,7 @@ function preview(canRebindTiming = true, liveEdits?: PreviewLiveEdits) {
       expiresAt: Date.now() + 350, changes: [root, clip], ...overrides } });
     return replies[0]?.result;
   }
-  return { send, document, hooks, window };
+  return { send, document, hooks, window, replies };
 }
 
 it('applies a complete version once, preserves the media node and rebinds at the playhead', () => {
@@ -77,6 +77,42 @@ it('removes only the identified direct visual leaf and restores it if the player
   assert.equal(rolledBack.document.getElementById('title'), rolledBack.target);
   assert.equal(rolledBack.target.nextSibling, next);
   assert.equal(rolledBack.target.parentElement?.getAttribute('data-hf-authored-duration'), '15');
+});
+
+it('adds a direct visual leaf at its verified sibling and rolls it back if playing cannot resume', () => {
+  const change = { id: 'copy', hfId: 'copy-hf', tag: 'div', attributes: [], insert: {
+    owner: 'root', next: 'title-hf', whitespace: ['', '\n', ''], text: 'Copy',
+    attrs: [['class', 'clip'], ['data-start', '4'], ['data-duration', '2'], ['style', 'background:#ddd;z-index:2']],
+  } };
+  const frame = preview();
+  const title = frame.document.getElementById('title')!;
+  title.setAttribute('data-hf-id', 'title-hf');
+  const audio = frame.document.getElementById('clip');
+  for (const invalid of [
+    { ...change, insert: { ...change.insert, next: 'unknown' } },
+    { ...change, insert: { ...change.insert, attrs: [...change.insert.attrs, ['src', 'asset']] } },
+    { ...change, insert: { ...change.insert, whitespace: ['old', '', ''] } },
+    { ...change, tag: 'video' },
+  ]) assert.equal(frame.send({ changes: [invalid] }), false);
+  assert.equal(frame.send({ before: etag(3), changes: [change] }), false);
+  assert.equal(preview(false).send({ changes: [change] }), false);
+
+  const rebind = frame.window.__hfForceTimelineRebind;
+  frame.window.__hfForceTimelineRebind = () => { throw new Error('failed'); };
+  assert.equal(frame.send({ changes: [change, root] }), false);
+  assert.equal(frame.document.getElementById('copy'), null);
+  assert.equal(title.previousSibling, audio);
+  frame.window.__hfForceTimelineRebind = rebind;
+  assert.equal(frame.send({ changes: [change, root] }), true);
+  const added = frame.document.getElementById('copy')!;
+  assert.equal(added.nextElementSibling, title);
+  assert.equal(added.textContent, 'Copy');
+  assert.equal(added.getAttribute('data-hf-id'), 'copy-hf');
+  assert.equal(frame.document.getElementById('clip'), audio);
+  assert.deepEqual(frame.hooks.slice(-3), ['seek:4', 'rebind', 'play']);
+  frame.send({ type: 'handshake', timelineOnly: true });
+  assert.equal(frame.replies.find(message => message.type === 'timeline-state')?.timelineVersion, etag(2));
+
 });
 
 it('updates text and placement on the same live nodes without seeking or replacing media', () => {
