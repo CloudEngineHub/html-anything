@@ -1,8 +1,8 @@
 import { randomBytes } from 'node:crypto';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { componentOverlaySource } from '../../shared/registry-material-compat.ts';
-import { MAX_PATCH_BYTES, type TextPatch } from '../../shared/text-patch.ts';
+import type { TextPatch } from '../../shared/text-patch.ts';
 import type { AuthContext } from '../contracts/auth.ts';
 import { CloudError } from '../contracts/errors.ts';
 import type { BlobScope, StoragePort } from '../contracts/storage.ts';
@@ -18,6 +18,8 @@ import { primaryFile } from './motion-component-source.ts';
 import { getMotionComponent, prepareMotionComponent } from './motion-component-registry.ts';
 import { validateTextPatch } from './text-patch-boundaries.ts';
 
+// Existing callers may use the patch form even for very short files.
+const SMALL_TEXT_PATCH_BYTES = 64 * 1024;
 const version = z.string().regex(/^"(?:sha256|patch):[a-f0-9]{64}"$/);
 const splice = z.tuple([z.number().int().nonnegative(), z.number().int().nonnegative(), z.string()])
   .transform(([offset, removed, insert]) => [offset, removed, insert] as const);
@@ -38,7 +40,7 @@ function invalid(message: string) {
 }
 export interface PendingTextRevision {
   path: string; parentScope: BlobScope; parentId: string; sizeBytes: number;
-  mimeType: string; depth: number; chainPatchBytes: number; patch: TextPatch;
+  mimeType: string; depth: number; chainPatchBytes: number; checkpointDue: boolean; patch: TextPatch;
 }
 export interface TextEditIdentity {
   requestId: string; writeToken?: string; source: 'studio'|'agent';
@@ -49,8 +51,8 @@ export interface TextEditIdentity {
 /** Called inside the existing project lock, after receipt replay and all file preconditions. */
 export async function appendTextRevisions(tx: DbTransaction, workspaceId: string, projectId: string,
   revisions: readonly PendingTextRevision[]) {
-  const rows = revisions.map(({path, ...revision}) => ({
-    path, record: {...revision, workspaceId, projectId, id: randomBytes(32).toString('hex')},
+  const rows = revisions.map(({path, checkpointDue, ...revision}) => ({
+    path, record: {...revision, workspaceId, projectId, id: randomBytes(32).toString('hex'), checkpointDueAt: checkpointDue ? sql`now()` : null},
   }));
   await tx.insert(projectTextRevisions).values(rows.map(({record}) => record));
   return rows.map(({path, record}) => ({
@@ -125,28 +127,26 @@ export async function commitTextEdits(files: ProjectFilesService, db: Database, 
     if (!parent) throw invalid('Invalid patch base');
     if (!item.patch.length) continue;
     const sizeBytes = await validateTextPatch(db, {workspaceId: ctx.workspaceId, projectId, base: parent, patch: item.patch, storage});
-    if (patchBytes > MAX_PATCH_BYTES && !canPatchBeSmaller(item.patch, parent.sizeBytes)) {
+    if (patchBytes > SMALL_TEXT_PATCH_BYTES && !canPatchBeSmaller(item.patch, parent.sizeBytes)) {
       throw invalid('Send content for a large replacement whose patch cannot be smaller than the complete file.');
     }
     let depth = 1;
     let chainPatchBytes = patchBytes;
     if (parent.blobScope === 'patch') {
       const [stored] = await db.select({depth: projectTextRevisions.depth, chainBytes: projectTextRevisions.chainPatchBytes,
-        checkpoint: projectTextRevisions.checkpointSha})
+        checkpoint: projectTextRevisions.checkpointSha, dueAt: projectTextRevisions.checkpointDueAt})
         .from(projectTextRevisions).where(and(eq(projectTextRevisions.workspaceId, ctx.workspaceId),
           eq(projectTextRevisions.projectId, projectId), eq(projectTextRevisions.id, parent.sha256)));
       if (!stored) throw new CloudError('STORAGE_ERROR', 'Missing text revision', {status: 500});
-      if (!stored.checkpoint && (stored.depth >= TEXT_CHECKPOINT_INTERVAL ||
-          stored.chainBytes + patchBytes > TEXT_CHECKPOINT_BYTES)) {
-        if (!storage.ensureTextCheckpoint) throw new CloudError('STORAGE_ERROR', 'Checkpoint storage is unavailable', {status: 503});
-        await storage.ensureTextCheckpoint(ctx.workspaceId, parent.sha256);
-      } else if (!stored.checkpoint) {
-        depth = stored.depth + 1;
+      // A pending snapshot starts the next counting interval even while its bytes are still being built.
+      if (!stored.checkpoint && !stored.dueAt) {
+        depth += stored.depth;
         chainPatchBytes += stored.chainBytes;
       }
     }
+    const due = depth >= TEXT_CHECKPOINT_INTERVAL || chainPatchBytes >= TEXT_CHECKPOINT_BYTES;
     revisions.push({path: item.path, parentScope: parent.blobScope, parentId: parent.sha256, sizeBytes,
-      mimeType: parent.mimeType, depth, chainPatchBytes, patch: item.patch});
+      mimeType: parent.mimeType, patch: item.patch, checkpointDue: due, depth, chainPatchBytes});
   }
   if (item) {
     for (const path of catalogPaths) {

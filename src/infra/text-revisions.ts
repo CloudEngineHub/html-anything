@@ -106,6 +106,7 @@ export async function loadTextRevisionChain(db: DbExecutor, workspace: string, i
 }
 
 export class TextRevisionStorage {
+  private readonly activeCheckpoints = new Map<string, Promise<string>>();
   readonly db: Database;
   readonly blobs: Pick<StoragePort, 'getObjectBuffer' | 'putBlobIfAbsent'>;
   constructor(db: Database, blobs: TextRevisionStorage['blobs']) {
@@ -136,37 +137,63 @@ export class TextRevisionStorage {
     return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
 
-  /** Lock this immutable revision only. Other projects and subsequent reads remain concurrent. */
-  async checkpoint(workspace: string, id: string): Promise<string> {
-    // This revision is immutable. Reuse its materialization if the collector still owns the CAS row.
-    let materialized: { bytes: Buffer; sha: string } | undefined;
-    return withBlobGcRetry(() => this.db.transaction(async tx => {
-      const result = await tx.execute<{ project_id: string; checkpoint_sha: string | null; mime_type: string }>(sql`
-        SELECT project_id, checkpoint_sha, mime_type FROM project_text_revisions
-        WHERE workspace_id = ${workspace} AND id = ${id} FOR UPDATE
+  checkpoint(workspace: string, id: string): Promise<string> {
+    const key = `${workspace}:${id}`;
+    const active = this.activeCheckpoints.get(key);
+    if (active) return active;
+    const task = this.publishCheckpoint(workspace, id).finally(() => this.activeCheckpoints.delete(key));
+    this.activeCheckpoints.set(key, task);
+    return task;
+  }
+
+  private async publishCheckpoint(workspace: string, id: string): Promise<string> {
+    const revision = await this.db.execute<{ project_id: string; checkpoint_sha: string | null; mime_type: string }>(sql`
+      SELECT project_id, checkpoint_sha, mime_type FROM project_text_revisions WHERE workspace_id = ${workspace} AND id = ${id}
+    `);
+    const row = revision.rows[0];
+    if (!row) throw missing();
+    if (row.checkpoint_sha) return row.checkpoint_sha;
+    const bytes = await this.read(workspace, id);
+    const sha = digest(bytes);
+    const key = workspaceBlobKey(workspace, sha);
+
+    // The unpublished reservation makes an in-flight object visible to GC only. Readers still
+    // use the parent and patch until the object and its boundary index have both been published.
+    const published = await withBlobGcRetry(() => this.db.transaction(async tx => {
+      const revision = await tx.execute<{checkpoint_sha: string | null}>(sql`
+        SELECT checkpoint_sha FROM project_text_revisions WHERE workspace_id = ${workspace} AND id = ${id} FOR UPDATE
       `);
-      const row = result.rows[0];
-      if (!row) throw missing();
-      if (row.checkpoint_sha) return row.checkpoint_sha;
-      if (!materialized) {
-        const bytes = await this.read(workspace, id, MAX_TEXT_BYTES, tx);
-        materialized = { bytes, sha: digest(bytes) };
-      }
-      const { bytes, sha } = materialized;
-      const key = workspaceBlobKey(workspace, sha);
-      // Lock the content row before publishing the bytes. The GC claim must either precede
-      // this transaction (retry) or observe the new checkpoint reference after it commits.
-      const claim = await tx.execute(sql`
+      if (!revision.rows[0]) throw missing();
+      if (revision.rows[0].checkpoint_sha) return revision.rows[0].checkpoint_sha;
+      const claimed = await tx.execute(sql`
         INSERT INTO workspace_blobs (workspace_id, sha256, s3_key, size_bytes, mime_type, ref_count, zero_ref_since)
-        VALUES (${workspace}, ${sha}, ${key}, ${bytes.length}, ${row.mime_type}, 0, now())
-        ON CONFLICT (workspace_id, sha256) DO UPDATE SET sha256 = excluded.sha256 WHERE workspace_blobs.gc_state = 'active'
+        VALUES (${workspace}, ${sha}, ${key}, ${bytes.length}, ${row.mime_type}, 0, NULL)
+        ON CONFLICT (workspace_id, sha256) DO UPDATE SET zero_ref_since = NULL WHERE workspace_blobs.gc_state = 'active'
         RETURNING sha256
       `);
-      if (!claim.rows.length) throw new CloudError('BLOB_GC_IN_PROGRESS', 'Checkpoint object is being collected.', { status: 409, applied: false });
-      await prepareFullBaseline(tx, { workspaceId: workspace, projectId: row.project_id, scope: 'workspace', id: sha, bytes });
-      await this.blobs.putBlobIfAbsent(key, bytes, row.mime_type);
-      await tx.execute(sql`UPDATE project_text_revisions SET checkpoint_sha = ${sha} WHERE workspace_id = ${workspace} AND id = ${id}`);
-      return sha;
+      if (!claimed.rows.length) throw new CloudError('BLOB_GC_IN_PROGRESS', 'Checkpoint object is being collected.', { status: 409, applied: false });
+      await tx.execute(sql`UPDATE project_text_revisions SET checkpoint_pending_sha = ${sha},
+        checkpoint_due_at = COALESCE(checkpoint_due_at, now() + interval '1 minute') WHERE workspace_id = ${workspace} AND id = ${id}`);
+      return null;
     }));
+    if (published) return published;
+    await this.blobs.putBlobIfAbsent(key, bytes, row.mime_type);
+    await this.db.transaction(async tx => {
+      const result = await tx.execute(sql`
+        UPDATE project_text_revisions SET checkpoint_sha = ${sha}, checkpoint_pending_sha = NULL
+        WHERE workspace_id = ${workspace} AND id = ${id} AND checkpoint_pending_sha = ${sha}
+        RETURNING id
+      `);
+      if (!result.rows.length) {
+        const done = await tx.execute(sql`SELECT 1 FROM project_text_revisions
+          WHERE workspace_id = ${workspace} AND id = ${id} AND checkpoint_sha = ${sha}`);
+        if (!done.rows.length) throw missing();
+        return;
+      }
+      await prepareFullBaseline(tx, { workspaceId: workspace, projectId: row.project_id, scope: 'workspace', id: sha, bytes });
+      await tx.execute(sql`UPDATE workspace_blobs SET zero_ref_since = now()
+        WHERE workspace_id = ${workspace} AND sha256 = ${sha} AND ref_count = 0 AND zero_ref_since IS NULL`);
+    });
+    return sha;
   }
 }
