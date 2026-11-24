@@ -199,8 +199,9 @@ export const PREVIEW_BRIDGE_SCRIPT = scopedScript(`
     else parentWindow.postMessage(message,targetOrigin);
   }
   function ready(){
-    var mountedVersions=settings.smallMountedSources&&Object.fromEntries(settings.smallMountedSources.map(function(path){return [path,sourceIdentity(sourceVersions[path]).fileVersion];}));
-    post('preview-ready',{timingDocumentId:timingDocumentId,styleDocumentId:styleDocumentId,liveEdits:settings.liveEdits,mountedVersions:mountedVersions,htmlSources:settings.htmlSources,capabilities:['selection','selection-geometry','edit-element','timeline','playback-control','pick-mode','refresh-parked-scene','layer-tree','layer-select','layer-family','inspect-element','canvas-framing','canvas-drag','inline-text','asset-readiness','thumbnail-capture','browser-export']});
+    var paths=[compositionPath].concat(settings.smallMountedSources||[]);
+    var mountedVersions=Object.fromEntries(paths.map(function(path){return [path,sourceIdentity(sourceVersions[path]).fileVersion];}).filter(function(entry){return typeof entry[1]==='string';}));
+    post('preview-ready',{timingDocumentId:timingDocumentId,styleDocumentId:styleDocumentId,liveEdits:Object.assign({presentation:true},settings.liveEdits),mountedVersions:mountedVersions,htmlSources:settings.htmlSources,capabilities:['selection','selection-geometry','edit-element','timeline','playback-control','pick-mode','refresh-parked-scene','layer-tree','layer-select','layer-family','inspect-element','canvas-framing','canvas-drag','inline-text','asset-readiness','thumbnail-capture','browser-export']});
     var state=timeline(true);
     if(state.duration>0){
       durationBootAnnounced=true;
@@ -225,6 +226,12 @@ export const PREVIEW_BRIDGE_SCRIPT = scopedScript(`
     if(!message || message.source!==PARENT || message.version!==VERSION || message.projectId!==projectId || message.token!==token) return;
     var requestId=message.requestId;
     try {
+      if(message.type==='mounted-file-version'){
+        if (!settings.studioOrigin || settings.studioOrigin !== event.origin) return;
+        const mounted = styleDocumentId && message.documentId === styleDocumentId && typeof message.path === 'string' &&
+          Object.hasOwn(sourceVersions, message.path) && sourceIdentity(sourceVersions[message.path]).fileVersion;
+        respond(requestId,mounted || null); return;
+      }
       if(message.type==='peer-timing' || message.type==='peer-presentation'){
         if (!settings.studioOrigin || settings.studioOrigin !== event.origin) return;
         respond(requestId,applyPeerTiming(message)); return;
@@ -323,7 +330,7 @@ export const PREVIEW_BRIDGE_SCRIPT = scopedScript(`
         if(message.phase==='start'){
           const started=drag?.id===message.gestureId ? drag : null;
           const hit=started?.element || (!message.corner && document.elementFromPoint(message.x * innerWidth,message.y * innerHeight)?.closest('[data-hf-id],[id]'));
-          if(hit && hit!==document.body && hit!==document.documentElement) reportLayerSelection(hit, started?.selection || describe(hit));
+          if(hit && hit!==document.body && hit!==document.documentElement) reportLayerSelection(hit, started?.selection || describe(hit), message.additive);
         }
         if(message.phase==='start' || message.phase==='finish') respond(requestId,result);
         return;

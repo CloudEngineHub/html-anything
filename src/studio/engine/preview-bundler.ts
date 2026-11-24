@@ -1,6 +1,5 @@
-import { MAX_PEER_PREVIEW_SOURCE_LENGTH } from '../../../shared/preview-timing.ts';
 import { formatFileVersion } from '../etag.ts';
-import { isPassivePreviewTag, staticPreviewHtmlSources } from './preview-html-sources.ts';
+import { isPassivePreviewTag, isPreviewDataScript, staticPreviewHtmlSources } from './preview-html-sources.ts';
 import { verifiedPreviewLiveEdits } from './preview-live-edits.ts';
 import { bridgeDocumentTags, previewBuildBusyScript } from './preview-bridge.ts';
 import { posix } from 'node:path';
@@ -551,12 +550,11 @@ async function applyDeterministicFonts(html: string, options: BundlePreviewOptio
 
 // User code can sample timing once at startup. Rebinding the runtime alone cannot replay its effects.
 function hasOnlyDeclarativeMarkup(doc: Document, runtimeUrl: string, includeFormatting = false): boolean {
-  const scripts = doc.querySelectorAll('script');
-  const runtime = scripts[0];
-  if (scripts.length !== 1 || !runtime?.hasAttribute(RUNTIME_BOOTSTRAP_ATTR) ||
-      runtime.getAttribute('src') !== runtimeUrl || runtime.textContent?.trim()) return false;
+  const runtime = Array.from(doc.querySelectorAll('script')).find(el => el.hasAttribute(RUNTIME_BOOTSTRAP_ATTR) &&
+    el.getAttribute('src') === runtimeUrl && !el.textContent?.trim());
+  if (!runtime) return false;
   return ![...doc.querySelectorAll('*')].some(el =>
-    (el !== runtime && el.localName !== 'canvas' && !isPassivePreviewTag(el.localName, includeFormatting)) ||
+    (el !== runtime && el.localName !== 'canvas' && !isPassivePreviewTag(el.localName, includeFormatting) && !isPreviewDataScript(el)) ||
     el.hasAttribute('http-equiv') ||
     el.getAttributeNames().some(name => name.toLowerCase().startsWith('on')));
 }
@@ -755,7 +753,7 @@ export async function bundlePreviewInMemory(
       if (!resolved) return null;
       htmlSources?.add(resolved);
       const html = project.readText(resolved);
-      if (options.bridgeOrigin && !options.capture && html !== null && html.length <= MAX_PEER_PREVIEW_SOURCE_LENGTH) smallMountedSources.add(resolved);
+      if (options.bridgeOrigin && !options.capture && html !== null) smallMountedSources.add(resolved);
       return html === null ? null : scopeNestedSources(project, resolved, sourceDir, ensureHfIds(html));
     },
     parseHtml: html => {

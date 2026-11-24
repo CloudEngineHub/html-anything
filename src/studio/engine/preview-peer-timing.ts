@@ -1,12 +1,15 @@
+import { indexGroupMembers, stageGroupChange } from "../../../shared/preview-group.ts";
 import { isLiveMediaMove } from '../../../shared/preview-live-media.ts';
 import { stageVisualClipInsert } from '../../../shared/preview-visual-insert.ts';
 import { STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR } from '../../../packages/edit-core/canvas-position.ts';
-import { PREVIEW_ATTRIBUTES, canPatchPreviewAttribute, PRESENTATION_TAGS, PRESENTATION_STYLES, MAX_PREVIEW_TEXT_LENGTH, isLivePositionEdit, isPaintOnlyChange, isMediaBoxChange, canPatchPresentationValue } from '../../../shared/preview-timing.ts';
+import { PREVIEW_ATTRIBUTES, canPatchPreviewAttribute, PRESENTATION_TAGS, PRESENTATION_STYLES, MAX_PREVIEW_TEXT_LENGTH, isAuthoredPresentation, isLivePositionEdit, isPaintOnlyChange, isMediaBoxChange, canPatchPresentationValue } from '../../../shared/preview-timing.ts';
 
 // Runs inside the token-scoped iframe. Each change targets a verified live node and file revision.
 export const PREVIEW_PEER_TIMING = `
   const canPatchPreviewAttribute = ${canPatchPreviewAttribute.toString()};
   const previewAttributes = new Set(${JSON.stringify(PREVIEW_ATTRIBUTES)});
+  const indexGroupMembers = ${indexGroupMembers.toString()};
+  const stageGroup = ${stageGroupChange.toString()};
   const mediaBox = ${isMediaBoxChange.toString()};
   const paintOnly = ${isPaintOnlyChange.toString()};
   const presentationTags = new Set(${JSON.stringify(PRESENTATION_TAGS)});
@@ -20,10 +23,10 @@ export const PREVIEW_PEER_TIMING = `
     const match = /^"(sha256|patch):([a-f0-9]{64})"$/.exec(tag);
     return match ? (match[1] === 'patch' ? tag : match[2]) : null;
   }
-  function stagePresentation(node, change, effects, local, pending) {
+  function stagePresentation(node, change, effects, local, pending, authored) {
     if (change.captureOriginalTranslate !== undefined) {
       const move = Array.isArray(change.styles) && change.styles.find(style => Array.isArray(style) && style[0] === 'translate');
-      if (typeof change.captureOriginalTranslate !== 'boolean' || !timingDocumentId || !move) return false;
+      if (typeof change.captureOriginalTranslate !== 'boolean' || !(timingDocumentId || authored) || !move) return false;
       const from = change.captureOriginalTranslate ? null : move[2];
       const to = change.captureOriginalTranslate ? move[1] : null;
       const actual = node.getAttribute(originalTranslateAttribute);
@@ -67,6 +70,7 @@ export const PREVIEW_PEER_TIMING = `
     }
     return true;
   }
+  const isAuthoredPresentation = ${isAuthoredPresentation.toString()};
   const isPositionEdit = ${isLivePositionEdit.toString()};
   const isMediaMove = ${isLiveMediaMove.toString()};
   const stageClipInsert = ${stageVisualClipInsert.toString()};
@@ -95,22 +99,25 @@ export const PREVIEW_PEER_TIMING = `
     const base = ownDrag ? pending.confirmedVersion || pending.sha256 : sourceVersions[m.path];
     const measured = ownDrag && pending.ordered && Array.isArray(m.changes) && m.changes.length === 1 && mediaBox(m.changes[0]);
     const position = measured || settings.liveEdits?.position === true && m.type === 'peer-presentation' &&
-      Array.isArray(m.changes) && m.changes.length <= 32 && (isPositionEdit(m.changes) || m.changes.every(paintOnly));
+      Array.isArray(m.changes) && (isPositionEdit(m.changes) || m.changes.every(paintOnly));
     const media = settings.liveEdits?.mediaTiming === true && m.type === 'peer-timing' &&
-      Array.isArray(m.changes) && m.changes.length <= 32 && isMediaMove(m.changes);
-    const target = temporary || position || media ? styleDocumentId : timingDocumentId;
+      Array.isArray(m.changes) && isMediaMove(m.changes);
+    // Only this mounted file may update its verified live text/style, preserving the
+    // already-executed handlers. Nested scenes also need their remount cache updated.
+    const authored = m.type === 'peer-presentation' && m.path === compositionPath && isAuthoredPresentation(m.changes);
+    const target = temporary || position || media || authored ? styleDocumentId : timingDocumentId;
     if (!target || m.documentId !== target || (temporary ? !!timingDocumentId : !position && m.path !== compositionPath) ||
         !before || !after || before !== base ||
         !Number.isFinite(m.expiresAt) || Date.now() >= m.expiresAt ||
         (!ownDrag && !paintDuringDrag && (drag || pendingDrags.size)) ||
         (inlineText && !(local && inlineText.id === m.gestureId && inlineText.after !== undefined)) || !p || typeof p.seek !== 'function' ||
         typeof p.getTime !== 'function' || typeof window.__hfForceTimelineRebind !== 'function' ||
-        !Array.isArray(m.changes) || m.changes.length > 32) return false;
+        !Array.isArray(m.changes)) return false;
     const sameContent = !m.changes.length && m.sameContent === true && m.type === 'peer-timing' && !!timingDocumentId;
     if (!m.changes.length && !sameContent) return false;
     const drafting = typeof m.structureDraftId === 'string';
     if (drafting && (!timingDocumentId || m.type !== 'peer-timing' || before !== after ||
-        !m.structureDraftId.length || m.structureDraftId.length > 64 || !m.changes.some(c => c?.removeFromComposition || c?.insert))) return false;
+        !m.structureDraftId.length || m.structureDraftId.length > 64 || !m.changes.some(c => c?.removeFromComposition || c?.insert || c?.group))) return false;
     if (structureDraft) {
       if (drafting) return false;
       const draft = structureDraft;
@@ -128,9 +135,31 @@ export const PREVIEW_PEER_TIMING = `
     }
     const edits = [], effects = [], placements = [];
     let structureChanged = false;
+    // Bulk edits resolve IDs in one traversal, including duplicate IDs across source files.
+    const targets = new Map();
+    const bulk = m.changes.length > 8;
+    if (bulk) {
+      for (const node of document.querySelectorAll('[data-hf-id], [id], [data-composition-id]')) {
+        if (sourceFileForElement(node) !== m.path) continue;
+        for (const attr of ['data-hf-id', 'id', 'data-composition-id']) {
+          const value = node.getAttribute(attr);
+          if (!value) continue;
+          const key = node.localName + ':' + attr + ':' + value;
+          targets.set(key, targets.has(key) ? null : node);
+        }
+      }
+    }
     for (const change of m.changes) {
       if (!change || (!change.hfId && !change.id && !change.compositionId) || !Array.isArray(change.attributes) ||
-          (!change.attributes.length && !change.styles && !change.text && !change.removeFromComposition && !change.insert) || change.attributes.length > previewAttributes.size) return false;
+          (!change.attributes.length && !change.styles && !change.text && !change.removeFromComposition && !change.insert && !change.group) || change.attributes.length > previewAttributes.size) return false;
+      if (change.group) {
+        if (m.changes.length !== 1 || !timingDocumentId || m.type !== 'peer-timing') return false;
+        const applyGroup = stageGroup(document, change.group, presentationTags);
+        if (!applyGroup) return false;
+        structureChanged = true;
+        effects.push(applyGroup);
+        continue;
+      }
       if (change.insert) {
         if (structureChanged || !timingDocumentId || m.type !== 'peer-timing') return false;
         const insert = stageClipInsert(document, change, presentationTags);
@@ -142,10 +171,16 @@ export const PREVIEW_PEER_TIMING = `
       if ((temporary || ownDrag) && (!change.styles || change.text || change.attributes.length)) return false;
       const selector = change.hfId ? '[data-hf-id="'+CSS.escape(change.hfId)+'"]' :
         change.id ? '#'+CSS.escape(change.id) : '[data-composition-id="'+CSS.escape(change.compositionId)+'"]';
-      const matches = Array.from(document.querySelectorAll(selector)).filter(node =>
-        node.localName === change.tag && sourceFileForElement(node) === m.path);
-      if (matches.length !== 1 || matches[0].closest('[data-hf-parked-scene]')) return false;
-      const node = matches[0];
+      let node;
+      if (bulk) {
+        const key = change.hfId ? 'data-hf-id:' + change.hfId : change.id ? 'id:' + change.id : 'data-composition-id:' + change.compositionId;
+        node = targets.get(change.tag + ':' + key);
+      } else {
+        const matches = Array.from(document.querySelectorAll(selector)).filter(candidate =>
+          candidate.localName === change.tag && sourceFileForElement(candidate) === m.path);
+        if (matches.length === 1) node = matches[0];
+      }
+      if (!node || node.closest('[data-hf-parked-scene]')) return false;
       if (measured && node !== pending.element) return false;
       if (change.removeFromComposition) {
         const parent = node.parentElement, next = node.nextSibling;
@@ -162,7 +197,7 @@ export const PREVIEW_PEER_TIMING = `
         const livePosition = getComputedStyle(node).position;
         if (livePosition !== 'static' && livePosition !== 'relative') return false;
       }
-      if (!stagePresentation(node, change, effects, local, pending)) return false;
+      if (!stagePresentation(node, change, effects, local, pending, authored)) return false;
       if (position && !temporary) placements.push([node, selector, change]);
       for (const [name, from, to] of change.attributes) {
         if (!previewAttributes.has(name) || [from, to].some(value => !canPatchPreviewAttribute(name, value, node.localName))) return false;
