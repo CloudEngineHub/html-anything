@@ -24,6 +24,7 @@ interface Drag {
   finishing: boolean;
   pickSettled: boolean;
   finishSettled: boolean;
+  waitingForSource?: boolean;
   corner?: Corner;
   bounds?: LayerBounds;
   offset?: { x: number; y: number };
@@ -74,6 +75,8 @@ export function IsolatedCanvasOverlay() {
     if (!lastPick.current) setDraft(null);
   }, [domEditSelection]);
 
+  const session = useRef(0);
+  const reportUnapplied = useCallback(() => showToast(t("This canvas edit was not saved. Try again when the preview is ready."), "error"), [showToast, t]);
   const observedFrame = useRef<HTMLIFrameElement | null>(null);
   const cancel = useCallback(() => {
     const active = drag.current;
@@ -84,11 +87,18 @@ export function IsolatedCanvasOverlay() {
     setDraft(null);
   }, []);
 
+  const notifyUnapplied = useRef(reportUnapplied);
+  notifyUnapplied.current = reportUnapplied;
+  const handleFrameLoad = useCallback(() => {
+    if (drag.current?.offset) notifyUnapplied.current();
+    cancel();
+  }, [cancel]);
+
   useEffect(() => {
     const releaseRetired = ({ retired }: { retired: HTMLIFrameElement | null }) => {
       if (!retired) return;
       if (observedFrame.current === retired) {
-        retired.removeEventListener("load", cancel);
+        retired.removeEventListener("load", handleFrameLoad);
         observedFrame.current = null;
       }
       if (lastPick.current?.adapter.iframe === retired) {
@@ -98,12 +108,13 @@ export function IsolatedCanvasOverlay() {
     };
     const stopPromoted = onPreviewPromoted(document, releaseRetired);
     return () => {
+      session.current++;
       stopPromoted();
-      observedFrame.current?.removeEventListener("load", cancel);
+      observedFrame.current?.removeEventListener("load", handleFrameLoad);
       observedFrame.current = null;
       cancel();
     };
-  }, [projectId, select, writeBlockedReason, cancel]);
+  }, [projectId, select, writeBlockedReason, cancel, handleFrameLoad]);
 
   function showBounds(active: Drag) {
     if (!active.bounds) return;
@@ -126,9 +137,9 @@ export function IsolatedCanvasOverlay() {
     const x = (startX - frame.x) / frame.width, y = (startY - frame.y) / frame.height;
     if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1)) return;
     if (observedFrame.current !== iframe) {
-      observedFrame.current?.removeEventListener("load", cancel);
+      observedFrame.current?.removeEventListener("load", handleFrameLoad);
       observedFrame.current = iframe;
-      iframe.addEventListener("load", cancel);
+      iframe.addEventListener("load", handleFrameLoad);
     }
     const corner = (event.target as HTMLElement).closest<HTMLElement>("[data-resize-corner]")?.dataset.resizeCorner as Corner | undefined;
     const active: Drag = {
@@ -147,10 +158,11 @@ export function IsolatedCanvasOverlay() {
     // Keep the last visible bounds until the new hit has been measured.
     event.currentTarget.setPointerCapture(event.pointerId);
     const target = corner && domEditSelection?.isolatedTarget;
-    void adapter.request<Pick | null>("canvas-drag", { phase: "start", gestureId: active.gestureId, x, y, corner,
+    void adapter.request<Pick | { waitingForSource: true } | null>("canvas-drag", { phase: "start", gestureId: active.gestureId, x, y, corner,
       ...(target && { target: { sourceFile: target.sourceFile, elementId: target.elementId, hfId: target.hfId } }) })
       .then(pick => {
         if (lastPick.current !== active || !pick) return;
+        if ("waitingForSource" in pick) { active.waitingForSource = true; return; }
         const bounds = relativeLayerBounds(pick);
         if (!bounds) return;
         active.bounds = bounds;
@@ -188,21 +200,31 @@ export function IsolatedCanvasOverlay() {
     active.finishing = true;
     let committed = false;
     let changed = false;
+    const gestureSession = session.current;
     const wholePath = event.altKey || !usePlayerStore.getState().autoKeyframeEnabled;
     void active.adapter.request<DragResult | null>("canvas-drag", { ...payload, wholePath }).then(async result => {
-      if (drag.current !== active || previewIframeRef.current !== active.adapter.iframe) return;
-      if (createPreviewAdapter({ iframe: active.adapter.iframe }).token !== active.adapter.token) return;
+      if (drag.current !== active) return;
+      if (previewIframeRef.current !== active.adapter.iframe || createPreviewAdapter({ iframe: active.adapter.iframe }).token !== active.adapter.token) {
+        reportUnapplied();
+        return;
+      }
       if (!validResult(result) || result.corner !== active.corner || (active.corner &&
-        !(Number.isFinite(result.width) && Number.isFinite(result.height) && result.width! > 0 && result.height! > 0))) return;
+        !(Number.isFinite(result.width) && Number.isFinite(result.height) && result.width! > 0 && result.height! > 0))) {
+        if (active.waitingForSource || active.bounds || result) reportUnapplied();
+        return;
+      }
       // Pointer capture is free while this gesture waits for its own save.
       drag.current = null;
       const frame = active.adapter.iframe;
       const saved = await saveCanvasDrag(frame, result.sourceFile, active.gestureId, result.predecessor, async version => {
         const patch = positionPatch(result);
-        if (version && (previewIframeRef.current !== frame || createPreviewAdapter({ iframe: frame }).token !== active.adapter.token)) return;
+        // The authenticated measurement is complete. A preview swap while a prior
+        // write settles cannot invalidate its target and conditional source version.
+        if (gestureSession !== session.current) return;
         if (version) patch.ifMatch = version;
         return commitDomEditPatchBatches([patch], { label: active.corner ? "Resize layer" : "Move layer", coalesceKey: active.gestureId });
       });
+      if (!saved && gestureSession === session.current) reportUnapplied();
       committed = saved?.durable === true;
       changed = saved?.changed === true;
     }, () => { if (drag.current === active) showToast(t("Preview unavailable"), "error"); }).catch(() => {
