@@ -256,8 +256,8 @@ export function useRenderQueue(
       const target = jobId ? incoming?.find(job => job.id === jobId || Boolean(requestId && requestId === job.requestId))
         : incoming?.toSorted((a, b) => b.createdAt - a.createdAt)[0];
       if (incoming && jobId && !target) {
-        setJobs(previous => previous.map(job => job.id === jobId && job.status === "unknown" && !job.nativeJobId
-          ? { ...job, requestNotFound: true } : job));
+        setJobs(previous => previous.map(job => job.id === jobId && job.status === "unknown"
+          ? { ...job, workerActive: false, requestNotFound: true, lastCheckedAt: Date.now() } : job));
       }
       finish({ outcome: incoming ? "success" : "unknown", ...(target ? { state_after: target.status } : {}) });
     } finally { rechecking.current = false; }
@@ -655,12 +655,24 @@ export function useRenderQueue(
     try {
       const res = await studioApiFetch(studioProjectUrl(`/api/render/${encodeURIComponent(job.nativeJobId)}/cancel`, projectId), { method: "POST" });
       if (currentProject.current !== projectId) return;
+      if (res.status === 404) {
+        closeActiveEventSource(jobId);
+        setJobs(previous => previous.map(candidate => candidate.id === jobId && isPendingRender(candidate)
+          ? { ...candidate, status: "unknown", workerActive: false, requestNotFound: true, lastCheckedAt: Date.now() } : candidate));
+        return;
+      }
       if (!res.ok) throw new Error("Couldn't confirm cancellation. Check the original export.");
       const data = await res.json();
       const status = readRenderStatus(data.status);
       if (!status) throw new Error("Couldn't confirm cancellation. Check the original export.");
+      if (status === "cancelled" || status === "complete" || status === "failed") closeActiveEventSource(jobId);
       setJobs(previous => previous.map(candidate => candidate.id === jobId && isPendingRender(candidate)
-        ? { ...candidate, status, lastCheckedAt: Date.now() } : candidate));
+        ? {
+            ...candidate,
+            status,
+            ...(typeof data.workerActive === "boolean" ? { workerActive: data.workerActive } : {}),
+            lastCheckedAt: Date.now(),
+          } : candidate));
     } catch (error) {
       if (currentProject.current !== projectId) return;
       const message = error instanceof Error ? error.message : "Couldn't confirm cancellation. Check the original export.";
@@ -668,7 +680,7 @@ export function useRenderQueue(
         ? { ...candidate, status: "unknown", error: message } : candidate));
       setActionError(message);
     }
-  }, [projectId, setJobs]);
+  }, [closeActiveEventSource, projectId, setJobs]);
 
   const deleteRender = useCallback(
     async (jobId: string) => {
@@ -685,9 +697,13 @@ export function useRenderQueue(
         return;
       }
       closeActiveEventSource(jobId);
+      if (target?.status === "unknown" && target.requestNotFound) {
+        setJobs((prev) => prev.filter((j) => j.id !== jobId));
+        return;
+      }
       try {
         const res = await studioApiFetch(studioProjectUrl(`/api/render/${encodeURIComponent(jobId)}`, projectId), { method: "DELETE" });
-        if (!res.ok) {
+        if (!res.ok && res.status !== 404) {
           setActionError("Couldn't delete the render. It's still on disk.");
           return;
         }
