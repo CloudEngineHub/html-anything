@@ -59,6 +59,15 @@ export async function appendTextRevisions(tx: DbTransaction, workspaceId: string
   }));
 }
 
+// The inserted strings have exactly the same JSON escaping in both wire forms. Each
+// retained UTF-8 byte can cost at most six JSON bytes (e.g. a control character).
+// This upper bound rules out wasteful patches without reading the unchanged source.
+function canPatchBeSmaller(patch: TextPatch, baseBytes: number): boolean {
+  const retained = patch.reduce((bytes, [, removed]) => bytes - removed, baseBytes);
+  const envelope = patch.map(([offset, removed]) => [offset, removed, '']);
+  return JSON.stringify({ patch: envelope }).length < '{"content":""}'.length + 6 * retained;
+}
+
 export async function commitTextEdits(files: ProjectFilesService, db: Database, storage: StoragePort,
   ctx: AuthContext, projectId: string, body: unknown, identity: TextEditIdentity): Promise<CommitProjectFilesResult> {
   const parsed = batchSchema.safeParse(body);
@@ -113,9 +122,12 @@ export async function commitTextEdits(files: ProjectFilesService, db: Database, 
       continue;
     }
     const patchBytes = Buffer.byteLength(JSON.stringify(item.patch));
-    if (!parent || patchBytes > MAX_PATCH_BYTES) throw invalid('Invalid patch base or size');
+    if (!parent) throw invalid('Invalid patch base');
     if (!item.patch.length) continue;
     const sizeBytes = await validateTextPatch(db, {workspaceId: ctx.workspaceId, projectId, base: parent, patch: item.patch, storage});
+    if (patchBytes > MAX_PATCH_BYTES && !canPatchBeSmaller(item.patch, parent.sizeBytes)) {
+      throw invalid('Send content for a large replacement whose patch cannot be smaller than the complete file.');
+    }
     let depth = 1;
     let chainPatchBytes = patchBytes;
     if (parent.blobScope === 'patch') {
