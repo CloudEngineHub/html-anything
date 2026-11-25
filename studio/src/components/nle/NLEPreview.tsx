@@ -15,6 +15,8 @@ import {
   type RefObject,
 } from "react";
 import { Player } from "../../player";
+import { CachedCompositionPoster } from "../../player/components/CachedCompositionPoster";
+import { compositionPathOfPreviewUrl } from "../../utils/projectCompositionPath";
 import { postFrameDisplayScale } from "../../player/lib/runtimeProtocol";
 import type { NLEContextValue } from "./NLEContext";
 import {
@@ -488,9 +490,10 @@ export const NLEPreview = memo(function NLEPreview({
         key={`${activeKey}-${slot.gen}`}
         ref={setPreviewIframeRef}
         showInitialLoading
+        loadingPoster={<CachedCompositionPoster projectId={projectId} compositionPath={directUrl ? compositionPathOfPreviewUrl(directUrl) : "index.html"} />}
         canEditWhileLoading={canEditWhileLoading}
         trackAssets
-        projectId={directUrl ? undefined : projectId}
+        projectId={projectId}
         directUrl={directUrl}
         onLoad={() => {
           updateCompositionSizeFromPreview();
