@@ -31,7 +31,9 @@ import { HOST_CAPABILITIES } from '../../../shared/desktop-contract';
 import {
   exportDesktopDiagnosticBundle,
   getDesktopHostBridge,
+  isDesktopApp,
   openExternalUrl,
+  startDesktopBrowserLogin,
   subscribeDesktopMenuActions,
 } from '../utils/platformHost';
 import { discord, feishu } from './CommunityLink';
@@ -47,6 +49,14 @@ import { WorkspaceProjectsButton } from './WorkspaceProjectsButton';
 import { MobileEditorDesktopGuide } from './MobileEditorDesktopGuide';
 import { Skeleton } from '../components/ui/Skeleton';
 import { AuthRecoveryNotice } from './authRecovery';
+import {
+  clearAuthPendingDraft,
+  currentReturnToPath,
+  readAuthPendingDraft,
+  saveAuthPendingDraft,
+  type AuthPendingDraft,
+} from './authRecoveryStore';
+import { buildLoginUrl } from './AccountSettings';
 import { changesWorkspaceDestination, defaultDesignScene, isLegacyWorkspaceHref, readWorkspacePage, workspacePageHref, type SettingsSection, type WorkspacePage } from './workspacePageRouting';
 import type { SoundTabId } from './soundTabs';
 import { WORKSPACE_LOCATION_CHANGED, initializeWorkspaceHistory, navigateWorkspaceHistory, readLocationWorkspaceSource, restoreWorkspaceSource, workspaceHistoryIndex, workspaceHistorySource, workspaceSettingsSource, writeWorkspaceHistory } from '../utils/workspaceHistory';
@@ -63,7 +73,7 @@ import { useWorkspaceBlocker } from '../router/useWorkspaceBlocker';
 import { isNotFoundSpaPath } from '../../../shared/spa-routes';
 import { isCloudFeatureEnabled, useCloudFeatureEnabled } from '../utils/cloudFeatures';
 
-import { WorkspaceChromeContext, useWorkspaceChrome, type WorkspaceChrome, type EditorGuard } from './WorkspaceChromeContext';
+import { WorkspaceChromeContext, useWorkspaceChrome, type WorkspaceChrome, type EditorGuard, type GuestSignInIntent } from './WorkspaceChromeContext';
 export { useWorkspaceChrome, useOptionalWorkspaceChrome, type EditorGuard } from './WorkspaceChromeContext';
 
 type WorkspaceFrameProps = {
@@ -297,7 +307,7 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
   useEffect(() => setSidebarOpen(editorRoute && !narrow), [editorRoute, narrow]);
   const navigationCollapsed = !editorActive;
   const toggleSidebar = useCallback(() => setSidebarOpen(open => !open), []);
-  const openEditor = () => { navigatePage({ motion: false, templates: false }); if (narrow) setSidebarOpen(false); };
+  const openEditor = useCallback(() => { navigatePage({ motion: false, templates: false }); if (narrow) setSidebarOpen(false); }, [navigatePage, narrow]);
   const openAssets = useCallback(() => { navigatePage({ assets: true, assetId: null, assetVersion: null, templates: false }); }, [navigatePage]);
   const openSkills = useCallback((skillCategory: SkillCategory | null = null, trigger?: HTMLElement) => {
     skillsTrigger.current = trigger ?? null;
@@ -363,11 +373,90 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
     };
     window.addEventListener('keydown', key); return () => window.removeEventListener('keydown', key);
   }, [editorActive, openSettings, toggleSidebar]);
+  const guestMode = Boolean(workspace.authRequired);
+  const startGuestSignIn = useCallback((intent: GuestSignInIntent) => {
+    const returnTo = currentReturnToPath();
+    saveAuthPendingDraft({
+      action: intent.action,
+      templateId: intent.templateId,
+      instruction: intent.instruction,
+      idempotencyKey: intent.idempotencyKey,
+      returnTo,
+      autoResume: true,
+    });
+    const loginUrl = buildLoginUrl(returnTo);
+    if (isDesktopApp()) {
+      void startDesktopBrowserLogin({ loginUrl, returnTo });
+    } else {
+      window.location.assign(loginUrl);
+    }
+  }, []);
+  const resumePendingDraft = useCallback(async (draft: AuthPendingDraft): Promise<boolean> => {
+    if (draft.action === 'use_template' && draft.templateId) {
+      return sessionId
+        ? workspace.createArtifact(sessionId, draft.templateId, draft.idempotencyKey)
+        : workspace.startSession(draft.instruction, draft.templateId, 'motion', draft.idempotencyKey);
+    }
+    if (draft.action === 'create_project') {
+      return workspace.create(draft.instruction, draft.idempotencyKey);
+    }
+    if (draft.action === 'open_editor') {
+      const target = workspace.projects[0];
+      if (target) {
+        if (target.id === projectId) {
+          openEditor();
+          return true;
+        }
+        return workspace.open('projects', target.id);
+      }
+      return workspace.create(undefined, draft.idempotencyKey);
+    }
+    if (draft.templateId) {
+      return sessionId
+        ? workspace.createArtifact(sessionId, draft.templateId, draft.idempotencyKey)
+        : workspace.startSession(draft.instruction, draft.templateId, 'motion', draft.idempotencyKey);
+    }
+    if (draft.instruction) {
+      return workspace.startSession(draft.instruction, undefined, 'motion', draft.idempotencyKey);
+    }
+    return true;
+  }, [sessionId, workspace.createArtifact, workspace.startSession, workspace.create, workspace.open, workspace.projects, projectId, openEditor]);
+  const autoResumedKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!workspace.status || guestMode || workspace.busy) return;
+    const pending = readAuthPendingDraft();
+    if (!pending?.autoResume) return;
+    if (pending.action === 'open_editor' && !workspace.catalogLoaded) return;
+    if (autoResumedKeyRef.current === pending.idempotencyKey) return;
+    autoResumedKeyRef.current = pending.idempotencyKey;
+    void resumePendingDraft(pending).then(ok => {
+      const latest = readAuthPendingDraft();
+      if (!latest || latest.idempotencyKey !== pending.idempotencyKey) return;
+      if (ok) {
+        clearAuthPendingDraft();
+      } else {
+        saveAuthPendingDraft({
+          action: latest.action,
+          returnTo: latest.returnTo,
+          idempotencyKey: latest.idempotencyKey,
+          templateId: latest.templateId,
+          instruction: latest.instruction,
+          projectId: latest.projectId,
+          homeDraftSnapshot: latest.homeDraftSnapshot,
+          autoResume: false,
+        });
+      }
+    });
+  }, [workspace.status, workspace.catalogLoaded, guestMode, workspace.busy, resumePendingDraft]);
   const libraryBusy = workspace.busy || blocked || Boolean(editorState?.blocked);
-  const switchingDisabled = libraryBusy || !workspace.status;
-  const motionEditorDisabled = switchingDisabled || workspace.projects.length === 0;
+  const switchingDisabled = libraryBusy || (!workspace.status && !guestMode);
+  const motionEditorDisabled = libraryBusy || (!guestMode && (!workspace.status || workspace.projects.length === 0));
   const openMotionEditor = async (selection: 'first' | 'last') => {
     if (motionEditorDisabled) return;
+    if (guestMode) {
+      startGuestSignIn({ action: 'open_editor' });
+      return;
+    }
     const current = projectId ?? workspace.activeProjectId;
     const previous = selection === 'last' ? workspace.projects.find(project => project.id === current) : undefined;
     const target = previous ?? workspace.projects[0];
@@ -405,7 +494,7 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
     openLibrary(trigger);
     if (narrow) setSidebarOpen(false);
   };
-  const value: WorkspaceChrome = { workspace, switchingDisabled, saveState: editorState?.saveState || saveState, registerEditor, beforeViewChange,
+  const value: WorkspaceChrome = { workspace, switchingDisabled, guestMode, startGuestSignIn, saveState: editorState?.saveState || saveState, registerEditor, beforeViewChange,
     openLibrary,
     openConnections: entry => {
       connectionEntry.current = entry;
@@ -545,7 +634,12 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
   const visibleSettings = templatesPage || standaloneMcp ? null : settings;
   const showStudioBackToExplore = page.studio?.scene.modality === 'image' && fromExplore && !sourcePage.community && !sourcePage.medium;
   const openTemplateFromOverlay = (id: string) => {
-    if (!switchingDisabled) void (sessionId ? workspace.createArtifact(sessionId, id) : workspace.startSession(undefined, id));
+    if (switchingDisabled) return;
+    if (guestMode) {
+      startGuestSignIn({ action: 'use_template', templateId: id });
+      return;
+    }
+    void (sessionId ? workspace.createArtifact(sessionId, id) : workspace.startSession(undefined, id));
   };
   const overlaySharedProps = {
     page,
@@ -557,6 +651,9 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
     detailOnly,
     libraryBusy,
     switchingDisabled,
+    guestMode,
+    onGuestTemplateSignIn: (templateId: string, requestId: string) =>
+      startGuestSignIn({ action: 'use_template', templateId, idempotencyKey: requestId }),
     workspaceError: workspace.error,
     cardPreview,
     libraryTrigger,
@@ -588,18 +685,9 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
         onOpenScenarioHub={workflowsEnabled ? () => openScenarioHub() : undefined}
         onNavigate={openStudio} onNavigateSound={openAudioNav} />
       <AuthRecoveryNotice
+        signedIn={!guestMode && Boolean(workspace.status)}
         onRetry={workspace.retryConnection}
-        onResumePendingDraft={async (draft) => {
-          if (draft.templateId) {
-            return sessionId
-              ? workspace.createArtifact(sessionId, draft.templateId)
-              : workspace.startSession(draft.instruction, draft.templateId);
-          }
-          if (draft.instruction) {
-            return workspace.startSession(draft.instruction);
-          }
-          return true;
-        }}
+        onResumePendingDraft={resumePendingDraft}
       />
       <div className="motion-workspace">
       {isRoutePending && <div className="motion-route-progress" role="progressbar" aria-hidden="true" />}
@@ -682,10 +770,10 @@ function WorkspaceSidebar({ archives, currentId, close, expand, query, setQuery,
   openTemplates: (trigger?: HTMLElement) => void;
 }) {
   const { t } = useI18n();
-  const { workspace, switchingDisabled } = useWorkspaceChrome();
+  const { workspace, switchingDisabled, guestMode, startGuestSignIn } = useWorkspaceChrome();
   const projects = workspace.projects;
   const filtered = projects.filter(project => project.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
-  const loadingProjects = !workspace.status && !workspace.error && projects.length === 0;
+  const loadingProjects = !guestMode && !workspace.status && !workspace.error && projects.length === 0;
   return <aside className="motion-sidebar" aria-label={t('Workspace navigation')}>
     <div className="motion-sidebar-brand">
       <strong className="om-subtitle">{t('Workspace')}</strong>
@@ -701,7 +789,11 @@ function WorkspaceSidebar({ archives, currentId, close, expand, query, setQuery,
         <Tooltip label={t('New project')}>
           <IconButton variant="ghost" type="button" className="motion-icon-button" aria-label={t('New project')} disabled={switchingDisabled} onClick={event => {
             void trackMotion('ui_click', { page_name: 'studio', area: 'workspace', element: 'new_creation', interaction_method: event.detail === 0 ? 'keyboard' : 'pointer' });
-            void workspace.create();
+            if (guestMode && startGuestSignIn) {
+              startGuestSignIn({ action: 'create_project' });
+            } else {
+              void workspace.create();
+            }
             onNavigate?.();
           }} icon={<MotionIcon name="plus-thin" size={20} />} />
         </Tooltip>
@@ -712,6 +804,10 @@ function WorkspaceSidebar({ archives, currentId, close, expand, query, setQuery,
       {loadingProjects && ['75%', '55%', '65%'].map(width => <div key={width} className="motion-session pointer-events-none" data-testid="project-list-skeleton" aria-hidden="true">
         <Skeleton style={{ width, height: 'var(--motion-space-16)' }} />
       </div>)}
+      {guestMode && !filtered.length && <div className="motion-session-empty" data-testid="project-list-guest">
+        <p>{t('Sign in with OpenDesign to view your projects.')}</p>
+        {startGuestSignIn && <Button variant="ghost" type="button" className="om-button h-auto" data-primary onClick={() => { startGuestSignIn({ action: 'open_editor' }); onNavigate?.(); }}>{t('Sign in with OpenDesign')}</Button>}
+      </div>}
       {workspace.status && !filtered.length && <p className="motion-session-empty">{t(query ? 'No matching projects' : 'Create a project with your Agent to start editing.')}</p>}
       {filtered.map(project => <DisclosureRow key={project.id} className="om-project-sidebar-row" active={currentId === project.id}
         action={<ProjectArchiveMenu projectId={project.id} title={project.title} archives={archives} />}>
