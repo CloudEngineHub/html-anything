@@ -1,8 +1,10 @@
 // @vitest-environment happy-dom
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OrderedTextEditOperation } from '../../../shared/ordered-text-edits';
-import { confirmedSource, observeSourceRead } from './confirmedTextSources';
-import { tryStudioCommandPatches, tryStudioTextEdit } from './studioTextEdits';
+import { confirmedSource, observeEditAssets, observeSourceRead } from './confirmedTextSources';
+import { readStudioAssetVersion, saveOrderedStudioFile, tryStudioCommandPatches, tryStudioTextEdit } from './studioTextEdits';
+import { orderedEditFixture } from '../../tests/orderedEditFixture';
+import { setCachedCloudDisklessMode } from './cloudRuntime';
 import { applyTextPatch } from '../../../shared/text-patch';
 import { getStudioSaveSnapshot, trackStudioProjectSave } from './studioSaveState';
 import { RejectedCanvasGesture } from './studioSaveDiagnostics';
@@ -161,4 +163,164 @@ it('starts the first batch by its deadline when continuous input precedes timer 
   }
   await Promise.all(saves);
   expect(batches.map(batch => batch.length)).toEqual([21, 4]);
+});
+
+it('chains a newly created empty file across an unrelated edit in the same packet', async () => {
+  const project = 'ordered-new-file';
+  setCachedCloudDisklessMode(true);
+  try {
+    const api = orderedEditFixture(project, { 'notes.txt': 'old' });
+    await Promise.all([
+      saveOrderedStudioFile(project, 'new.txt', '', undefined, null),
+      saveOrderedStudioFile(project, 'notes.txt', 'changed', 'old', await api.getVersion('notes.txt')),
+      saveOrderedStudioFile(project, 'new.txt', 'draft', '', null),
+    ]);
+    expect(api.packets).toHaveLength(1);
+    const [create, other, write] = api.packets[0]!;
+    expect(create?.files[0]?.baseVersion).toBe(null);
+    expect(typeof other?.files[0]?.baseVersion).toBe('string');
+    expect(write?.files[0]?.baseVersion).toEqual({after:create!.id});
+    expect(api.files).toEqual({'new.txt':'draft', 'notes.txt':'changed'});
+    expect(confirmedSource(project, 'new.txt')?.content).toBe('draft');
+  } finally {
+    setCachedCloudDisklessMode(null);
+  }
+});
+
+it('uses the freshly authored child file for the following operation before its first receipt', async () => {
+  const project = 'create-then-reference', path = 'child.html', host = 'index.html';
+  const source = '<main data-hf-id="hf-scene" data-composition-id="child" data-duration="5"></main>';
+  const gate = Promise.withResolvers<void>();
+  setCachedCloudDisklessMode(true);
+  try {
+    const api = orderedEditFixture(project, {[host]:'<main data-hf-id="hf-host" data-composition-id="host"></main>'}, () => gate.promise);
+    const { saveOrderedTimeline, projectedTimelineText } = await import('./orderedTimelineEdits');
+    const created = saveOrderedStudioFile(project, path, source, undefined, null);
+    const placed = saveOrderedTimeline(project, [{
+      path: host, apply: (html, inputs) => html.replace('</main>', '<p>' + inputs.get(path)!.match(/data-duration="(\d+)"/)![1] + '</p></main>'),
+    }], 'Use new composition', {readPaths:[path], recordEdit:vi.fn()});
+    expect(await projectedTimelineText(project, host)).toContain('<p>5</p>');
+    gate.resolve();
+    await Promise.all([created, placed]);
+    expect(api.packets).toHaveLength(1);
+    const [create, use] = api.packets[0]!;
+    expect(use!.dependencies?.[path]).toEqual({after:create!.id});
+    expect(api.files[host]).toMatch(/>5<\/p>/);
+    expect(api.request.mock.calls.some(([url]) => String(url).endsWith('/files/' + path))).toBe(false);
+  } finally {
+    gate.resolve();
+    setCachedCloudDisklessMode(null);
+  }
+});
+
+it('shares an in-flight metadata read for a binary dependency', async () => {
+  const gate = Promise.withResolvers<Response>();
+  const fetch = vi.fn().mockReturnValue(gate.promise);
+  vi.stubGlobal('fetch', fetch);
+  const path = 'media/song.mp3';
+  const first = readStudioAssetVersion('cold-media', path);
+  const second = readStudioAssetVersion('cold-media', path);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(String(fetch.mock.calls[0]![0])).toContain('media%2Fsong.mp3?view=metadata');
+  gate.resolve(Response.json({version:'audio-v1'}));
+  expect(await Promise.all([first, second])).toEqual(['audio-v1','audio-v1']);
+});
+
+describe('editable media dependencies', () => {
+  beforeEach(() => setCachedCloudDisklessMode(true));
+  afterEach(() => setCachedCloudDisklessMode(null));
+
+  const svgPath = 'art.svg';
+  const scenePath = 'index.html';
+  const emptyScene = '<main data-hf-id="hf-scene" data-composition-id="scene"></main>';
+  const newSvg = '<svg><circle r="8"/></svg>';
+
+  function placeSvg(project: string) {
+    return tryStudioCommandPatches(project, [{
+      kind: 'placeAsset', compositionPath: scenePath, assetPath: svgPath,
+      start: 0, duration: 1, track: 0, hfId: 'placed-art',
+    }], {});
+  }
+
+  it.each([
+    ['edit', false], ['edit', true], ['create', false], ['create', true],
+  ] as const)('places an SVG after %s with a preceding packet in flight: %s', async (action, inFlight) => {
+    const project = 'ordered-svg-' + action + '-' + inFlight;
+    const original = action === 'edit' ? '<svg/>' : undefined;
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    try {
+      const api = orderedEditFixture(project, { [scenePath]: emptyScene, ...(original && { [svgPath]: original }) },
+        () => { started.resolve(); return release.promise; });
+      const before = await api.getVersion(svgPath);
+      if (before) observeEditAssets(project, { [svgPath]: {version: before} });
+      const write = saveOrderedStudioFile(project, svgPath, newSvg, original, before);
+      if (inFlight) await started.promise;
+      const place = placeSvg(project);
+      release.resolve();
+      await Promise.all([write, place]);
+      expect(api.packets.map(packet => packet.length)).toEqual(inFlight ? [1, 1] : [2]);
+      const [written, placed] = api.packets.flat();
+      expect(placed!.dependencies?.[svgPath]).toEqual(inFlight ? await api.getVersion(svgPath) : { after: written!.id });
+      expect(api.files[scenePath]).toContain('art.svg');
+      expect(api.request.mock.calls.some(([url]) => String(url).endsWith('?view=metadata'))).toBe(false);
+    } finally {
+      release.resolve();
+    }
+  });
+
+  it('keeps a later peer edit to the SVG as a real placement conflict', async () => {
+    const project = 'ordered-svg-peer';
+    const api = orderedEditFixture(project, { [scenePath]: emptyScene, [svgPath]: '<svg/>' });
+    const original = (await api.getVersion(svgPath))!;
+    observeEditAssets(project, { [svgPath]: {version:original} });
+    await saveOrderedStudioFile(project, svgPath, newSvg, '<svg/>', original);
+    const ownVersion = await api.getVersion(svgPath);
+    await fetch('/api/projects/' + project + '/text-edits/batch', { method:'POST', body: JSON.stringify({ operations: [{
+      id:'peer-edit', label:'Change SVG', files:[{ path:svgPath, baseVersion:ownVersion, content:'<svg><path/></svg>' }],
+    }] }) });
+    await expect(placeSvg(project)).rejects.toMatchObject({ filePath:svgPath, currentVersion:await api.getVersion(svgPath) });
+    expect(api.packets.at(-1)![0]!.dependencies?.[svgPath]).toBe(ownVersion);
+    expect(api.files[scenePath]).toBe(emptyScene);
+  });
+
+  it('links a metadata-only dependency to an earlier file write in the same packet', async () => {
+    const project = 'svg-metadata-predecessor';
+    const api = orderedEditFixture(project, { [scenePath]: emptyScene, [svgPath]: '<svg/>' });
+    observeEditAssets(project, { [svgPath]: {version:(await api.getVersion(svgPath))!} });
+    await Promise.all([
+      tryStudioTextEdit(project, [{ path: svgPath, before: '<svg/>', after: newSvg }]),
+      placeSvg(project),
+    ]);
+    const [write, place] = api.packets[0]!;
+    expect(api.packets).toHaveLength(1);
+    expect(place!.dependencies?.[svgPath]).toEqual({after:write!.id});
+  });
+
+  it('does not place a peer SVG when the local creation of that path was rejected', async () => {
+    const project = 'svg-create-peer';
+    const api = orderedEditFixture(project, { [scenePath]: emptyScene, [svgPath]: '<svg><rect/></svg>' });
+    const results = await Promise.allSettled([
+      saveOrderedStudioFile(project, svgPath, newSvg, undefined, null),
+      placeSvg(project),
+    ]);
+    expect(results.map(result => result.status)).toEqual(['rejected', 'rejected']);
+    expect(api.files[scenePath]).toBe(emptyScene);
+    expect(api.files[svgPath]).toBe('<svg><rect/></svg>');
+  });
+
+  it('guards a timeline media reference to a newly authored SVG without a metadata request', async () => {
+    const project = 'svg-timeline-reference';
+    const api = orderedEditFixture(project, { [scenePath]: emptyScene });
+    const { saveOrderedTimeline } = await import('./orderedTimelineEdits');
+    await Promise.all([
+      saveOrderedStudioFile(project, svgPath, newSvg, undefined, null),
+      saveOrderedTimeline(project, [{ path:scenePath, apply:html => html.replace('</main>', '<img src="art.svg"></main>') }],
+        'Place SVG', {assetPaths:[svgPath], recordEdit:vi.fn()}),
+    ]);
+    const [write, place] = api.packets[0]!;
+    expect(api.packets).toHaveLength(1);
+    expect(place!.dependencies?.[svgPath]).toEqual({after:write!.id});
+    expect(api.request.mock.calls.some(([url]) => String(url).endsWith('?view=metadata'))).toBe(false);
+  });
 });

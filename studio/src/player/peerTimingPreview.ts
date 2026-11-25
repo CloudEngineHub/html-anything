@@ -6,7 +6,7 @@ import { createPreviewAdapter } from "./lib/previewAdapter";
 import { capturePresentedTimelineChanges } from "./lib/isolatedTimelineEdits";
 import { setPreviewMediaMuted } from "./lib/timelineIframeHelpers";
 import { usePlayerStore } from "./store/playerStore";
-import { PREVIEW_ATTRIBUTES, canPatchPreviewAttribute, PRESENTATION_STYLES, PRESENTATION_TAGS, MAX_PREVIEW_TEXT_LENGTH, type PreviewChange, type PreviewLiveEdits, isAuthoredPresentation, isPaintOnlyChange, isPixelBoxChange, isMediaBoxChange, isLivePositionEdit, canPatchPresentationValue } from "../../../shared/preview-timing";
+import { PREVIEW_ATTRIBUTES, canPatchPreviewAttribute, PRESENTATION_STYLES, PRESENTATION_TAGS, MAX_PREVIEW_TEXT_LENGTH, type PreviewChange, type PreviewLiveEdits, isGradeOnlyChange, isAuthoredPresentation, isPaintOnlyChange, isPixelBoxChange, isMediaBoxChange, isLivePositionEdit, canPatchPresentationValue } from "../../../shared/preview-timing";
 
 type FileSnapshot = { content: string; version: string };
 
@@ -229,8 +229,9 @@ export async function tryApplyPeerChanges(
   if (!changes || !isCurrent() || (options === "paint-only" && !changes.every(isPaintOnlyChange))) return false;
   const nestedBox = document.mountedVersions.has(update.path) && changes.length > 0 &&
     changes.every(change => presentationTags.has(change.tag) && isPixelBoxChange(change));
+  const grade = changes.length > 0 && changes.every(isGradeOnlyChange);
   const cssBox = cssLayoutOffset && changes.length > 0 && changes.every(change => isPixelBoxChange(change, true));
-  const canAdvance = nestedBox || cssBox || document.canRebind || (document.liveEdits.presentation && isAuthoredPresentation(changes)) || (measured && changes.length === 1 && isMediaBoxChange(changes[0]!)) || (document.liveEdits.position && (isLivePositionEdit(changes) || changes.every(isPaintOnlyChange))) ||
+  const canAdvance = grade || nestedBox || cssBox || document.canRebind || (document.liveEdits.presentation && isAuthoredPresentation(changes)) || (measured && changes.length === 1 && isMediaBoxChange(changes[0]!)) || (document.liveEdits.position && (isLivePositionEdit(changes) || changes.every(isPaintOnlyChange))) ||
     (document.liveEdits.mediaTiming && isLiveMediaMove(changes));
   const temporary = options === "temporary" || (!canAdvance && options === "keep-visible");
   if (temporary && (document.canRebind || !onlyStyles(changes))) return false;

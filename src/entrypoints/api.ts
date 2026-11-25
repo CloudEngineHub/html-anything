@@ -1,3 +1,4 @@
+import { formatFileVersion } from '../studio/etag.ts';
 import { readMcpProjectFile, type ProjectFileQuery } from '../mcp/project-file-read.ts';
 import {
   CatalogFilmstripAutoBakeDispatcher,
@@ -32,7 +33,7 @@ import {
   injectRuntimeConfigIntoHtml,
 } from '../../packages/observability/config.ts';
 import { commitProjectEdit } from '../services/project-edit.ts';
-import { compositionCanvasSource, type CanvasFit, type CanvasRatio } from '../../shared/composition-canvas.ts';
+import type { CanvasFit, CanvasRatio } from '../../shared/composition-canvas.ts';
 import {
   agentGuide,
   buildCloudIntegrationInfo,
@@ -80,7 +81,7 @@ import {
 import { PREVIEW_BRIDGE_ASSET_RE, PREVIEW_BRIDGE_PATH } from '../studio/engine/preview-bridge.ts';
 import { BROWSER_EXPORT_VENDOR_PATH } from '../studio/routes/preview.ts';
 import { isAssetLease, renewAssetLease, resolveAssetWorkspace } from '../auth/preview-asset-lease.ts';
-import { hasMinRole, hasScope, type AuthContext } from '../contracts/auth.ts';
+import { hasMinRole, hasScope, requireProgrammaticEdit, type AuthContext } from '../contracts/auth.ts';
 import { CloudError, featureDeferredP2, isCloudError } from '../contracts/errors.ts';
 import type { StoragePort } from '../contracts/storage.ts';
 import { createDbHandle, type Database, type DbHandle } from '../db/client.ts';
@@ -229,6 +230,7 @@ const STATIC_MIME_TYPES: Readonly<Record<string, string>> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
+  '.cjs': 'application/octet-stream',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.map': 'application/json; charset=utf-8',
@@ -1099,7 +1101,17 @@ function createMcpDomainPorts(deps: {
     handleMediaAction(auth: AuthContext, args: Record<string, unknown>): Promise<Record<string, unknown>>;
   };
 }): McpDomainPorts {
+  let editCli: Promise<{ url: string; sha256: string } | undefined> | undefined;
+  function localEditCli() {
+    if (!deps.files.textPatchWrites) return;
+    return editCli ??= readFile(path.join(deps.runtimeRoot, 'studio/build/edit-core-sha256'), 'utf8').then(sha256 => {
+      if (/^[a-f0-9]{64}$/.test(sha256)) return {
+        sha256, url: new URL('/editor-assets/openmotion-edit-' + sha256 + '.cjs', deps.config.APP_PUBLIC_ORIGIN).href,
+      };
+    }).catch(() => undefined);
+  }
   let cachedCaptionOps: Awaited<ReturnType<typeof loadCaptionSourceOperations>> | null = null;
+  let canvasOps: ReturnType<typeof import('../../shared/composition-canvas-source.ts').loadCanvasSourceOperations> | undefined;
   const getCaptionOps = async () => {
     if (!cachedCaptionOps) {
       cachedCaptionOps = await loadCaptionSourceOperations(deps.runtimeRoot);
@@ -1228,10 +1240,12 @@ function createMcpDomainPorts(deps: {
         const assetNames = await deps.assetNames.readAssetNames(auth, projectId, { paths: allFiles.map(f => f.path) });
         return {
           ...projectState,
+          localEditCli: await localEditCli(),
           files: allFiles.map((f) => ({
             path: f.path,
             size: f.sizeBytes,
             hash: f.sha256,
+            fileVersion: formatFileVersion(f.blobScope, f.sha256),
             mimeType: f.mimeType,
             isText: f.isText,
           })),
@@ -1296,14 +1310,20 @@ function createMcpDomainPorts(deps: {
       },
 
       async editProject(auth, args) {
+        if (args.canvas !== undefined || args.edit !== undefined) requireProgrammaticEdit(auth);
         const projectId = String(args.projectId ?? '');
         const requestId = String(args.requestId ?? '');
         const expectedRevision = String(args.expectedRevision ?? '');
         const expectedVersionId = String(args.expectedVersionId ?? '');
         const ops: ProjectFileOp[] = [];
 
-        if (args.edit !== undefined && ['files', 'canvas', 'assetNames', 'requirements', 'namingLanguage'].some(key => args[key] !== undefined)) {
-          throw new CloudError('INVALID_ARGUMENT', 'Submit an editing command separately from file and metadata changes.', { status: 400 });
+        const prepared = args.textEdits !== undefined;
+        if ((prepared || args.edit !== undefined) && ((prepared && args.edit !== undefined) ||
+            ['files', 'canvas', 'assetNames', 'requirements', 'namingLanguage'].some(key => args[key] !== undefined))) {
+          throw new CloudError('INVALID_ARGUMENT', 'Submit one editing command or one prepared edit separately from file and metadata changes.', { status: 400 });
+        }
+        if (prepared && !deps.files.textPatchWrites) {
+          throw new CloudError('INVALID_ARGUMENT', 'This deployment accepts semantic commands in edit.', { status: 400, applied: false });
         }
 
         if (Array.isArray(args.files)) {
@@ -1329,21 +1349,9 @@ function createMcpDomainPorts(deps: {
               applied: false,
             });
           }
-          const captionOps = await getCaptionOps();
-          const reframed = compositionCanvasSource(
-            existing.content,
-            {
-              parseHTML: captionOps.parseHTML,
-              rewriteStyles: (source, aliases) => {
-                let next = source;
-                for (const [from, to] of aliases) {
-                  next = next.replaceAll(`[${from}]`, `[${to}]`).replaceAll(`[${from}=`, `[${to}=`);
-                }
-                return next;
-              },
-            },
-            { ratio: canvas.ratio, fit: canvas.fit },
-          );
+          const { compositionCanvasSource } = await import('../../packages/edit-core/composition-canvas.ts');
+          const { loadCanvasSourceOperations } = await import('../../shared/composition-canvas-source.ts');
+          const reframed = compositionCanvasSource(existing.content, await (canvasOps ??= loadCanvasSourceOperations(deps.runtimeRoot)), canvas);
           ops.push({
             op: 'upsert_text',
             path: canvas.compositionPath,
@@ -1353,7 +1361,10 @@ function createMcpDomainPorts(deps: {
         }
 
         let committed = null;
-        if (args.edit !== undefined) {
+        if (prepared) {
+          committed = await deps.files.commitTextEdits(auth, projectId, args.textEdits,
+            { source: 'agent', requestId, observedProject: { expectedRevision, expectedVersionId } });
+        } else if (args.edit !== undefined) {
           committed = await commitProjectEdit(deps.files, auth, projectId, args.edit, requestId,
             { source: 'agent', expectedRevision, expectedVersionId });
         } else if (ops.length > 0 || args.requirements !== undefined || args.namingLanguage !== undefined) {
@@ -1419,7 +1430,7 @@ function createMcpDomainPorts(deps: {
 
         const latest = await deps.workspace.getProject(auth, projectId);
         // A retried command points to the committed version even after subsequent edits.
-        const project = args.edit && committed ? { ...latest, revision: committed.revision,
+        const project = (prepared || args.edit) && committed ? { ...latest, revision: committed.revision,
           currentVersionId: committed.versionId, currentVersionNumber: committed.versionNumber } : latest;
         return {
           projectId: project.id,
@@ -1669,6 +1680,7 @@ function createMcpDomainPorts(deps: {
           }
           const captionOps = await getCaptionOps();
           if (command === 'caption_add' || command === 'caption_update' || command === 'caption_toggle') {
+            requireProgrammaticEdit(auth);
             return commitCaptionCommand(deps.files, auth, captionOps, projectId, compositionPath, command, transcript);
           }
           const current = await deps.files.readTextFile(auth, projectId, compositionPath);
