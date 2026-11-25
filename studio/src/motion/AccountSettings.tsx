@@ -164,22 +164,110 @@ function normalizeAccountSummary(raw: CloudSummaryApiResponse): CloudAccountSumm
   };
 }
 
-export function buildLoginUrl(returnTo?: string): string {
+export function buildLoginUrl(returnTo?: string, attribution?: { hookId?: string; entryId?: string }): string {
   const target = returnTo ?? (typeof window !== 'undefined'
     ? `${window.location.pathname}${window.location.search}${window.location.hash}`
     : '/');
-  return `/auth/login?returnTo=${encodeURIComponent(target || '/')}`;
+  const params = new URLSearchParams({ returnTo: target || '/' });
+  if (attribution?.hookId) params.set('hook_id', attribution.hookId);
+  if (attribution?.entryId) params.set('entry_id', attribution.entryId);
+  return `/auth/login?${params.toString()}`;
 }
 
-export function useAccountSummary() {
-  const [account, updateAccount] = useState<CloudAccountSummary | null>(null);
+export function upgradePlan(account: CloudAccountSummary | null | undefined): 'free' | 'go' | undefined {
+  const plan = account?.state === 'signed-in' && !account.billingUnavailable ? account.plan?.trim().toLowerCase() : undefined;
+  return plan === 'free' || plan === 'go' ? plan : undefined;
+}
+
+export type ResolutionTier = '1K' | '2K' | '4K';
+
+const RESOLUTION_RANK: Record<ResolutionTier, number> = { '1K': 1, '2K': 2, '4K': 4 };
+
+export function parseResolutionScore(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim().toUpperCase();
+  const kMatch = /^(\d+(?:\.\d+)?)K$/.exec(trimmed);
+  if (kMatch) {
+    const score = Number.parseFloat(kMatch[1]!);
+    return Number.isFinite(score) && score > 0 ? score : undefined;
+  }
+  const dimMatch = /^(\d{3,5})\s*[X×]\s*(\d{3,5})$/.exec(trimmed);
+  if (dimMatch) {
+    const longest = Math.max(Number.parseInt(dimMatch[1]!, 10), Number.parseInt(dimMatch[2]!, 10));
+    if (Number.isFinite(longest) && longest > 0) return longest / 1024;
+  }
+  return undefined;
+}
+
+export function parseResolutionTier(value: unknown): ResolutionTier | undefined {
+  if (typeof value !== 'string') return undefined;
+  const upper = value.trim().toUpperCase();
+  if (upper === '1K' || upper === '2K' || upper === '4K') return upper;
+  return undefined;
+}
+
+export function imageResolutionCap(account: CloudAccountSummary | null | undefined, modelId?: string): ResolutionTier | undefined {
+  if (account?.state !== 'signed-in' || account.billingUnavailable) return undefined;
+  const plan = account.plan?.trim().toLowerCase();
+  if (!plan) return undefined;
+  if (plan === 'plus' || plan === 'go plus' || plan === 'go_plus') {
+    return modelId && /gpt[-_\s]?image[-_\s]?2\.0|gpt[-_\s]?2\.0/i.test(modelId) ? '2K' : '1K';
+  }
+  if (plan === 'pro' || plan === 'go pro' || plan === 'go_pro') return '2K';
+  if (plan === 'max' || plan === 'go max' || plan === 'go_max') return '4K';
+  return undefined;
+}
+
+export function exceedsResolutionCap(selectedResolution: unknown, cap: ResolutionTier | undefined): boolean {
+  if (!cap) return false;
+  const score = parseResolutionScore(selectedResolution);
+  return Boolean(score !== undefined && score > RESOLUTION_RANK[cap]);
+}
+
+export function isInsufficientBalanceError(error: string | null | undefined): boolean {
+  if (!error) return false;
+  // Never show top-up CTA for rate limits, concurrency limits, timeouts, or 503/5xx outages.
+  if (/\b(429|503|502|504)\b|rate[\s_-]?limit|too many requests|concurrent|service unavailable|timed?\s?out/i.test(error)) {
+    return false;
+  }
+  return /\b402\b|insufficient[\s_-]?(balance|credit|credits|funds|quota)|balance is too low|low[\s_-]?balance|out of credits|not enough credits|余额不足|额度不足/i.test(error);
+}
+
+let cachedAccountSummary: CloudAccountSummary | null = null;
+const accountSummaryListeners = new Set<(value: CloudAccountSummary | null) => void>();
+
+function publishAccountSummary(value: CloudAccountSummary | null): void {
+  cachedAccountSummary = value;
+  for (const listener of accountSummaryListeners) {
+    listener(value);
+  }
+}
+
+export function useAccountSummary(options?: { eager?: boolean }) {
+  const eager = options?.eager ?? true;
+  const [account, updateAccountState] = useState<CloudAccountSummary | null>(() => cachedAccountSummary);
+  const updateAccount = useCallback((value: CloudAccountSummary) => {
+    publishAccountSummary(value);
+  }, []);
+  useEffect(() => {
+    if (cachedAccountSummary !== null) {
+      updateAccountState(cachedAccountSummary);
+    }
+    const listener = (value: CloudAccountSummary | null) => {
+      updateAccountState(value);
+    };
+    accountSummaryListeners.add(listener);
+    return () => {
+      accountSummaryListeners.delete(listener);
+    };
+  }, []);
   const [error, setError] = useState(false);
   const request = useRef(0);
   const setAccount = useCallback((value: CloudAccountSummary) => {
     request.current++;
     updateAccount(value);
     setError(false);
-  }, []);
+  }, [updateAccount]);
   const refresh = useCallback(async (billing = false) => {
     const current = ++request.current;
     try {
@@ -214,16 +302,16 @@ export function useAccountSummary() {
       }
       setError(true);
     }
-  }, []);
+  }, [updateAccount]);
   useEffect(() => {
-    void refresh();
+    if (eager) void refresh();
     const update = () => void refresh();
     window.addEventListener('motion:account-changed', update);
     return () => {
       request.current++;
       window.removeEventListener('motion:account-changed', update);
     };
-  }, [refresh]);
+  }, [eager, refresh]);
   return { account, error, refresh, setAccount };
 }
 function formatDate(iso: string | null | undefined): string {

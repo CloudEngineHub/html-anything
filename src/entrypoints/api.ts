@@ -1,6 +1,7 @@
 import { projectSourceReadUrl } from '../../shared/project-source-url.ts';
 import { formatFileVersion } from '../studio/etag.ts';
 import { readMcpProjectFile, type ProjectFileQuery } from '../mcp/project-file-read.ts';
+import { createCloudTracking } from '../cloud-tracking.ts';
 import {
   CatalogFilmstripAutoBakeDispatcher,
   InMemoryCatalogFilmstripBakeState,
@@ -19,6 +20,7 @@ import { HeadBucketCommand } from '@aws-sdk/client-s3';
 import { serve, type ServerType } from '@hono/node-server';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { Hono, type Context } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Redis } from 'ioredis';
 import {
@@ -2375,7 +2377,9 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
   // 2. Auth & OAuth 2.1 Routes (`/auth/*`, `/.well-known/*`, `/oauth/*`, `/motion-api/tokens*`)
   // -------------------------------------------------------------------------
 
-  app.route('/', createAuthRoutes(authDeps));
+  const cloudTracking = createCloudTracking(VERSION);
+
+  app.route('/', createAuthRoutes({ ...authDeps, cloudTracking }));
 
   // -------------------------------------------------------------------------
   // 3. Streamable HTTP MCP (`/mcp` — Strict Bearer-Only Auth + 10 MiB Limit)
@@ -2509,26 +2513,108 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     });
   });
 
-  app.get('/motion-api/tracking', authMiddleware, (c) => {
-    return c.json({ enabled: false, locked: true, reason: 'cloud' });
+  const localTrackingHits = new Map<string, { count: number; resetAt: number }>();
+  const TRACKING_RATE_LIMIT_PER_MIN = 60;
+  const TRACKING_GLOBAL_LIMIT_PER_MIN = 1200;
+  const consumeLocalWindow = (key: string, limit: number): boolean => {
+    const now = Date.now();
+    if (localTrackingHits.size > 4096) {
+      for (const [k, v] of localTrackingHits) {
+        if (now >= v.resetAt) localTrackingHits.delete(k);
+      }
+      if (localTrackingHits.size > 4096) localTrackingHits.clear();
+    }
+    const entry = localTrackingHits.get(key);
+    if (!entry || now >= entry.resetAt) {
+      localTrackingHits.set(key, { count: 1, resetAt: now + 60_000 });
+      return true;
+    }
+    if (entry.count >= limit) return false;
+    entry.count += 1;
+    return true;
+  };
+  const checkTrackingRateLimit = async (rawIp: string): Promise<boolean> => {
+    const ip = rawIp.trim() || 'unknown';
+    const ipHash = createHash('sha256').update(ip).digest('hex').slice(0, 24);
+    if (deps.rateLimiter) {
+      try {
+        const [perIp, globalBudget] = await Promise.all([
+          deps.rateLimiter.consume(`tracking:${ipHash}`, TRACKING_RATE_LIMIT_PER_MIN, 60_000),
+          deps.rateLimiter.consume('tracking:global', TRACKING_GLOBAL_LIMIT_PER_MIN, 60_000),
+        ]);
+        return perIp.allowed && globalBudget.allowed;
+      } catch {
+        // Fall through to process-local bounded counter if Redis is briefly unavailable.
+      }
+    }
+    return consumeLocalWindow(ipHash, TRACKING_RATE_LIMIT_PER_MIN) && consumeLocalWindow('__global__', TRACKING_GLOBAL_LIMIT_PER_MIN);
+  };
+
+  app.get('/motion-api/tracking', (c) => {
+    const enabled = cloudTracking.isEnabled();
+    return c.json({ enabled, locked: true, reason: cloudTracking.lockReason() ?? 'cloud' });
   });
-  app.post('/motion-api/tracking', authMiddleware, (c) => {
-    return c.json({ ok: true, accepted: false }, 202);
+  app.post('/motion-api/tracking', bodyLimit({ maxSize: 64 * 1024 }), async (c) => {
+    const contentType = (c.req.header('content-type') ?? '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+      return c.json({ error: 'Content-Type must be application/json' }, 415);
+    }
+    const secFetchSite = (c.req.header('sec-fetch-site') ?? '').trim().toLowerCase();
+    if (secFetchSite !== 'same-origin') {
+      return c.json({ error: 'Same-origin browser fetch required' }, 403);
+    }
+    const originHeader = c.req.header('origin');
+    if (originHeader) {
+      const requestOrigin = new URL(c.req.url).origin;
+      const expectedOrigin = config.APP_PUBLIC_ORIGIN ? new URL(config.APP_PUBLIC_ORIGIN).origin : requestOrigin;
+      if (originHeader !== expectedOrigin && originHeader !== requestOrigin) {
+        return c.json({ error: 'Cross-origin tracking rejected' }, 403);
+      }
+    }
+    const resolveClientIp = (): string => {
+      if (config.TRUST_PROXY_HOPS > 0) {
+        const forwarded = c.req.header('x-forwarded-for');
+        if (forwarded) {
+          const hops = forwarded
+            .split(',')
+            .map((part) => part.trim())
+            .filter(Boolean);
+          if (hops.length > 0) {
+            return hops[Math.max(0, hops.length - config.TRUST_PROXY_HOPS)] ?? 'local';
+          }
+        }
+        const realIp = c.req.header('x-real-ip')?.trim();
+        if (realIp) return realIp;
+      }
+      return 'local';
+    };
+    if (!(await checkTrackingRateLimit(resolveClientIp()))) {
+      return c.json({ error: 'Too many tracking requests' }, 429);
+    }
+    if (!cloudTracking.isEnabled()) {
+      return c.json({ ok: true, accepted: false }, 202);
+    }
+    const body = await c.req.json().catch(() => null);
+    const acceptedCount = cloudTracking.acceptBrowserBatch(body);
+    return c.json({ ok: true, accepted: acceptedCount > 0, acceptedCount }, 202);
   });
-  const trackingPreferencesPayload = {
-    enabled: false,
-    preference: false,
-    locked: true,
-    reason: 'environment' as const,
+  const trackingPreferencesPayload = () => {
+    const enabled = cloudTracking.isEnabled();
+    return {
+      enabled,
+      preference: enabled,
+      locked: true,
+      reason: enabled ? ('deployment' as const) : ('environment' as const),
+    };
   };
   app.get('/motion-api/tracking/preferences', authMiddleware, (c) => {
-    return c.json(trackingPreferencesPayload);
+    return c.json(trackingPreferencesPayload());
   });
   app.put('/motion-api/tracking/preferences', authMiddleware, (c) => {
-    return c.json(trackingPreferencesPayload);
+    return c.json(trackingPreferencesPayload());
   });
   app.post('/motion-api/tracking/preferences', authMiddleware, (c) => {
-    return c.json(trackingPreferencesPayload);
+    return c.json(trackingPreferencesPayload());
   });
   app.post('/motion-api/diagnostics', authMiddleware, (c) => {
     return c.json({ ok: true, mode: 'cloud-container', version: VERSION });

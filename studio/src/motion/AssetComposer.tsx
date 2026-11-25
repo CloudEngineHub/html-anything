@@ -14,6 +14,7 @@ import { IconButton } from 'open-design-ui/icon-button';
 import { AssetTaskHistory } from './AssetTaskHistory';
 import { AssetGenerationCard, creationKinds } from './AssetCreationVisuals';
 import { GenerationParameters, emptyParameters, parameterInputImageRatio, requestParameters, shotParameters, type ParameterDraft } from './GenerationParameters';
+import { generationOptions, resolveGenerationParameters } from '../../../shared/generation-options';
 import { notifyProvidersChanged } from './useProviderDirectory';
 import { useWorkspaceChrome } from './WorkspaceFrame';
 import { useMediaCatalog } from './useMediaCatalog';
@@ -28,6 +29,9 @@ import { attachableReferenceLimit, creationModels } from './creationModels';
 import { isOpenDesignProvider, modelFamilyLabel, providerDisplayName } from './imageMenuModels';
 import { registeredProvider } from '../../../shared/provider-registry';
 import { CloudEmptyModelsNotice, isCloudEmptyCatalog, isUnifiedCloudGateway, ProviderSetupNotice } from './ProviderSetupNotice';
+import { exceedsResolutionCap, imageResolutionCap, upgradePlan, useAccountSummary } from './AccountSettings';
+import { hasEntitlementModalListeners, openEntitlementModal, useCloudWebMode } from './entitlementModalBus';
+import { FreePlanGenerationGate } from './EntitlementTouchpointCards';
 
 export interface AssetDraft { modality: Modality; prompt: string; relight?: RelightChoices; videoChoices?: Record<string, string>; shotPreferences?: { aspect: string; duration?: number }; preferredModel?: string; model?: string; parameters?: Record<string, unknown>; target?: { asset: LibraryAsset; versionId: string }; references: { reference: AssetReference; name: string }[] }
 export function AssetComposer({ active, studio, draft, setDraft, promptAppliedToken = 0, jobs, showCurrentJob = true, taskId, history, selectingTask, onNew, onCancel, onView, onRetrySave, onResume, onReference, onUploadReference, onUploadFiles, uploadingReferences = false, onCreated, onError, onInfo, onClose }: {
@@ -283,8 +287,12 @@ export function AssetComposer({ active, studio, draft, setDraft, promptAppliedTo
     </div>
   </div>;
 
+  const cloudWeb = useCloudWebMode();
+  const { account } = useAccountSummary({ eager: cloudWeb });
   const configureProvider = (providerId: string) => providerId === 'account'
-    ? (openAccountSettings ?? openModelSettings)()
+    ? (cloudWeb && hasEntitlementModalListeners()
+      ? openEntitlementModal({ mode: 'guest', hookId: 'studio_generate' })
+      : (openAccountSettings ?? openModelSettings)())
     : openProviderSettings ? openProviderSettings(providerId) : openModelSettings();
   const openSubscription = () => (openSubscriptionSettings ?? openAccountSettings ?? openModelSettings)();
   const providerSetupMessage = t(unifiedCloudOnly
@@ -325,7 +333,52 @@ export function AssetComposer({ active, studio, draft, setDraft, promptAppliedTo
             ? cloudFeatureUnavailableNotice
             : openDesignMissing ? openDesignSetup : manageProvidersNotice}
   </>;
-  const setup = <>
+  const cloudGuestSubmit = cloudWeb && account?.state === 'signed-out';
+  const isHostedSelected = Boolean(selected && (cloudWeb || isOpenDesignProvider(selected.provider) || selected.provider === 'account'));
+  const hostedPlanUpgrade = isHostedSelected ? upgradePlan(account) : undefined;
+  const resolvedParameters = (() => {
+    if (!selected) return undefined;
+    try {
+      const explicit = requestParameters(parameters, selected, draft.references.length > 0, activeDefaultValues);
+      return resolveGenerationParameters(selected, explicit, draft.references.length > 0);
+    } catch {
+      return undefined;
+    }
+  })();
+  const resolvedFields = selected ? generationOptions(selected, draft.references.length > 0)?.fields ?? [] : [];
+  const resolutionField =
+    resolvedFields.find(field => field.key === 'resolution') ??
+    resolvedFields.find(field => field.key === 'size');
+  const resolutionFieldKey: 'resolution' | 'size' = resolutionField?.key === 'size'
+    ? 'size'
+    : resolutionField?.key === 'resolution'
+      ? 'resolution'
+      : selected?.defaults && 'size' in selected.defaults && !('resolution' in selected.defaults)
+        ? 'size'
+        : resolvedParameters && 'size' in resolvedParameters && !('resolution' in resolvedParameters)
+          ? 'size'
+          : 'resolution';
+  const activeResolution =
+    resolvedParameters?.[resolutionFieldKey] ??
+    parameters.values[resolutionFieldKey] ??
+    draft.parameters?.[resolutionFieldKey] ??
+    resolutionField?.default ??
+    selected?.defaults?.[resolutionFieldKey];
+  const planResCap = isHostedSelected && !hostedPlanUpgrade && draft.modality === 'image'
+    ? imageResolutionCap(account, selected?.modelId)
+    : undefined;
+  const resolutionCapExceeded = (planResCap === '1K' || planResCap === '2K') && exceedsResolutionCap(activeResolution, planResCap);
+  const openResolutionUpgrade = () => {
+    if (cloudWeb && hasEntitlementModalListeners()) {
+      openEntitlementModal({ mode: 'upgrade', hookId: 'studio_res_gate' });
+    } else {
+      (openSubscriptionSettings ?? openAccountSettings ?? openModelSettings)();
+    }
+  };
+  const entitlementGate = hostedPlanUpgrade
+    ? <FreePlanGenerationGate onOpenProviders={cloudWeb ? undefined : openModelSettings} hookId="studio_free_gate" />
+    : null;
+  const setup = cloudGuestSubmit ? null : <>
       {unconfiguredPreferred && (imageWorkspace
         ? <ProviderSetupNotice message={t('{provider} needs setup before generating.', { provider: providerLabel })}>
           <Button variant="ghost" className="om-button h-auto" onClick={() => configureProvider(preferred!.provider)}>
@@ -349,14 +402,30 @@ export function AssetComposer({ active, studio, draft, setDraft, promptAppliedTo
   const generationSettings = parameterModel && <GenerationParameters key={parameterKey} model={parameterModel} draft={parameters}
     defaultValues={activeDefaultValues} appearance={imageWorkspace ? 'boxed' : 'standard'} popupClassName={imagePopupClass}
     hasInputImage={draft.references.length > 0} hidden={Object.keys(featureRule?.parameters ?? {})} onChange={value => {
+      const nextResolution = value.values[resolutionFieldKey];
+      if ((planResCap === '1K' || planResCap === '2K') && exceedsResolutionCap(nextResolution, planResCap)) {
+        openResolutionUpgrade();
+        return;
+      }
       setParameterDrafts(current => ({ ...current, [parameterKey]: value }));
       try { setDraft({ ...draft, model: parameterModel.id, parameters: requestParameters(value, parameterModel, draft.references.length > 0, activeDefaultValues) }); }
       catch { /* Keep invalid JSON or conflicting parameters in the local editor until corrected. */ }
     }} />;
-  const generate = !imageWorkspace && setupProvider ? <Button variant="plain" className="om-button om-creation-submit-button" data-primary onClick={() => configureProvider(setupProvider)}>
+  const generate = cloudGuestSubmit ? <Button variant="plain" className="om-button om-creation-submit-button" data-primary
+    disabled={busy || uploadingReferences}
+    onClick={() => openEntitlementModal({ mode: 'guest', hookId: 'studio_generate' })}>
+    <RemixIcon name="sparkling-fill" size={19} />{t(featureRule?.actionLabel ?? kind.action)}
+    <RemixIcon name="arrow-right-line" size={18} />
+  </Button> : !imageWorkspace && setupProvider ? <Button variant="plain" className="om-button om-creation-submit-button" data-primary onClick={() => configureProvider(setupProvider)}>
     <RemixIcon name="plug-line" size={19} />{t('Set up to generate')}<RemixIcon name="arrow-right-line" size={18} />
   </Button> : <Button variant="plain" className="om-button om-creation-submit-button" data-primary
-    disabled={busy || uploadingReferences || !selected || !promptReady || invalidReferences} onClick={() => void submit()}>
+    disabled={busy || uploadingReferences || !selected || !promptReady || invalidReferences || Boolean(hostedPlanUpgrade)} onClick={() => {
+      if (resolutionCapExceeded) {
+        openResolutionUpgrade();
+        return;
+      }
+      void submit();
+    }}>
     <RemixIcon name="sparkling-fill" size={19} />{t(busy ? 'Submitting your idea…' : featureRule?.actionLabel ?? kind.action)}
     <RemixIcon name="arrow-right-line" size={18} />
   </Button>;
@@ -447,9 +516,9 @@ export function AssetComposer({ active, studio, draft, setDraft, promptAppliedTo
         {setup}
         {modelNotice}
       </div>
-      <div className="om-image-submit">{generate}</div>
+      <div className="om-image-submit">{entitlementGate}{generate}</div>
     </>}
     </div>
-    {!imageWorkspace && <div className="om-creation-submit">{generate}<p className="om-creation-save-note"><RemixIcon name="stack-line" size={13} />{t('Saved automatically to your library')}</p><p className="om-eyebrow om-creation-billing">{t('Model usage is billed to your OpenDesign platform account.')}</p></div>}
+    {!imageWorkspace && <div className="om-creation-submit">{entitlementGate}{generate}<p className="om-creation-save-note"><RemixIcon name="stack-line" size={13} />{t('Saved automatically to your library')}</p><p className="om-eyebrow om-creation-billing">{t('Model usage is billed to your OpenDesign platform account.')}</p></div>}
   </aside>;
 }

@@ -1333,6 +1333,158 @@ it('focuses and pulses the prompt field when promptAppliedToken increments in vi
   }
 });
 
+it('opens upgrade modal directly when a Plus user clicks 2K on a size-based hosted model and keeps 1K selected', async () => {
+  const { setCachedCloudDisklessMode } = await import('../utils/cloudRuntime');
+  const { subscribeEntitlementModal } = await import('./entitlementModalBus');
+  setCachedCloudDisklessMode(true);
+  const modalRequests: Array<{ mode: string; hookId: string }> = [];
+  const unsubscribe = subscribeEntitlementModal(req => modalRequests.push(req));
+  gatewayRequest.mockImplementation(async (path: string) => {
+    if (path.startsWith('account/summary')) {
+      return {
+        state: 'signed-in',
+        plan: 'plus',
+        billingUnavailable: false,
+        email: 'plus@example.com',
+        name: 'Plus User',
+      };
+    }
+    return {};
+  });
+  try {
+    const seedream: Model = {
+      id: 'account:seedream-5.5',
+      provider: 'account',
+      modelId: 'seedream-5.5',
+      label: 'Seedream 5.5',
+      modality: 'image',
+      source: 'live',
+      mode: 'text-to-image',
+      defaults: { size: '1K' },
+      generationOptions: {
+        fields: [
+          {
+            key: 'size',
+            label: 'Resolution',
+            kind: 'choice',
+            defaultValue: '1K',
+            choices: [{ value: '1K', label: '1K' }, { value: '2K', label: '2K' }],
+          },
+        ],
+      },
+    };
+    loadGateway.mockResolvedValue({
+      models: [seedream],
+      status: { providers: [{ id: 'account', available: true }], routes: {} },
+    });
+    let latestDraft: AssetDraft = {
+      modality: 'image',
+      model: seedream.id,
+      prompt: 'Studio lighting bottle',
+      parameters: { size: '1K' },
+      references: [],
+    };
+    function Harness() {
+      const [draft, setDraft] = useState<AssetDraft>(latestDraft);
+      latestDraft = draft;
+      return <AssetComposer {...props} draft={draft} setDraft={setDraft} />;
+    }
+    await act(async () => root.render(<Harness />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    // No inline resolution-cap small box is rendered.
+    expect(container.querySelector('.om-entitlement-gate')).toBeNull();
+
+    // Clicking 2K immediately triggers the commercial upgrade modal and preserves 1K.
+    const summaryBtn = container.querySelector<HTMLButtonElement>('.om-generation-summary');
+    if (summaryBtn) await act(async () => summaryBtn.click());
+    const resolutionSelect = document.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="Resolution"]');
+    if (resolutionSelect) {
+      await act(async () => resolutionSelect.click());
+      const twoKOption = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+        el => el.textContent?.trim() === '2K',
+      );
+      expect(twoKOption).toBeDefined();
+      await act(async () => twoKOption!.click());
+    } else {
+      const twoKButton = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(
+        btn => btn.textContent?.trim() === '2K',
+      );
+      expect(twoKButton).toBeDefined();
+      await act(async () => twoKButton!.click());
+    }
+
+    expect(modalRequests).toEqual([{ mode: 'upgrade', hookId: 'studio_res_gate' }]);
+    expect(latestDraft.parameters?.size).toBe('1K');
+    expect(container.querySelector('.om-entitlement-gate')).toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('.om-creation-submit-button')?.disabled).toBe(false);
+  } finally {
+    unsubscribe();
+    setCachedCloudDisklessMode(null);
+  }
+});
+
+it('gates an untouched Plus draft whose hosted model profile defaults to 2K and opens the upgrade modal instead of submitting', async () => {
+  const { setCachedCloudDisklessMode } = await import('../utils/cloudRuntime');
+  const { subscribeEntitlementModal } = await import('./entitlementModalBus');
+  setCachedCloudDisklessMode(true);
+  const modalRequests: Array<{ mode: string; hookId: string }> = [];
+  const unsubscribe = subscribeEntitlementModal(req => modalRequests.push(req));
+  gatewayRequest.mockImplementation(async (path: string) => {
+    if (path.startsWith('account/summary')) {
+      return {
+        state: 'signed-in',
+        plan: 'plus',
+        billingUnavailable: false,
+        email: 'plus@example.com',
+        name: 'Plus User',
+      };
+    }
+    return {};
+  });
+  try {
+    const nanoBanana2: Model = {
+      id: 'account:nano-banana-2',
+      provider: 'account',
+      modelId: 'nano-banana-2',
+      label: 'Nano Banana 2',
+      modality: 'image',
+      source: 'live',
+      mode: 'text-to-image',
+      nativeOptions: {
+        profiles: {
+          generations: {
+            profiles: [
+              { aspect_ratio: '1:1', resolution: '1K' },
+              { aspect_ratio: '1:1', resolution: '2K' },
+            ],
+            default: { aspect_ratio: '1:1', resolution: '2K' },
+          },
+        },
+      },
+    };
+    loadGateway.mockResolvedValue({
+      models: [nanoBanana2],
+      status: { providers: [{ id: 'account', available: true }], routes: {} },
+    });
+    const untouchedDraft: AssetDraft = {
+      modality: 'image',
+      model: nanoBanana2.id,
+      prompt: 'Amber bottle on marble pedestal',
+      references: [],
+    };
+    await act(async () => root.render(<AssetComposer {...props} draft={untouchedDraft} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    await act(async () => container.querySelector<HTMLButtonElement>('.om-creation-submit-button')!.click());
+    expect(generate).not.toHaveBeenCalled();
+    expect(modalRequests).toEqual([{ mode: 'upgrade', hookId: 'studio_res_gate' }]);
+  } finally {
+    unsubscribe();
+    setCachedCloudDisklessMode(null);
+  }
+});
+
 it('hides placeholder model dropdowns and shows Cloud upgrade guidance across image and video studios when the workspace has zero models', async () => {
   const { mediaEditorDestination } = await import('./creativeStudios');
   const emptyCloudCatalog = {

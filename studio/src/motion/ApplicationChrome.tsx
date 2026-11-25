@@ -12,6 +12,7 @@ import { getDesktopHostBridge, isDesktopApp, startDesktopBrowserLogin, useDeskto
 import { HOST_CAPABILITIES } from '../../../shared/desktop-contract';
 import { useWorkspaceChrome } from './WorkspaceFrame';
 import { buildLoginUrl, useAccountSummary } from './AccountSettings';
+import { hasEntitlementModalListeners, openEntitlementModal, useCloudWebMode } from './entitlementModalBus';
 import { clearPrivateSwrCache } from './swrCache';
 import { CommunityLink } from './CommunityLink';
 import { clickMethod, clickOption, trackStudioClick } from './editorTracking';
@@ -128,6 +129,7 @@ export function ApplicationAccountMenu({ settings, openSettings }: { settings: S
       authMode: account.authMode ?? null,
     });
   }, [account]);
+  const cloudWeb = useCloudWebMode();
   const theme = useStudioThemePreference();
   const desktopApp = isDesktopApp();
   const updater = useDesktopUpdateState();
@@ -283,6 +285,10 @@ export function ApplicationAccountMenu({ settings, openSettings }: { settings: S
                 const loginUrl = buildLoginUrl();
                 if (isDesktopApp()) {
                   void startDesktopBrowserLogin({ loginUrl });
+                  return;
+                }
+                if (cloudWeb && hasEntitlementModalListeners()) {
+                  openEntitlementModal({ mode: 'guest', hookId: 'header_signin' });
                   return;
                 }
                 window.location.assign(loginUrl);
