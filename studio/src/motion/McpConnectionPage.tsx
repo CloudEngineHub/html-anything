@@ -36,6 +36,9 @@ import { useIntegrationInfo } from './useIntegrationInfo';
 import { readWorkspacePage, type WorkspacePage } from './workspacePageRouting';
 import type { WorkspaceChrome } from './WorkspaceChromeContext';
 import { DesktopConnectPanel, type DesktopConnectAgentId } from './DesktopConnectPanel';
+import { useAccountSummary } from './AccountSettings';
+import { hasEntitlementModalListeners, openEntitlementModal, useCloudWebMode } from './entitlementModalBus';
+import { isDesktopApp } from '../utils/platformHost';
 import './McpConnectionPage.css';
 
 type ConnectedAppEvidence = {
@@ -239,8 +242,14 @@ export function McpConnectionPage({
 
   const page = useRef<HTMLElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const cloudWeb = useCloudWebMode();
+  const { account } = useAccountSummary({ eager: cloudWeb });
+  const signedIn = account?.state === 'signed-in';
   const [galleryPosition] = useState(readMcpGalleryPosition);
   const example = (route ?? localRoute).mcpExample;
+  const matchedExample = example
+    ? mcpScenarios.find(item => item.id === example) ?? mcpCapabilities.find(item => item.id === example)
+    : undefined;
 
   useEffect(() => {
     if (galleryPosition) {
@@ -475,15 +484,19 @@ export function McpConnectionPage({
     >
       {breadcrumb}
 
-      {!inSettings && (
+      {!inSettings && !signedIn && (
         <div className="om-mcp-entitlement-strip">
           <span className="om-mcp-entitlement-dot" aria-hidden="true" />
           <span>{entitlementBefore}<strong>{t('available models and usage')}</strong>{entitlementAfter}</span>
           <Button variant="plain" className="om-mcp-entitlement-cta" onClick={() => {
             click('mcp_resources', 'sign_in');
+            if (cloudWeb && !isDesktopApp() && hasEntitlementModalListeners()) {
+              openEntitlementModal({ mode: 'guest', hookId: 'mcp_oauth' });
+              return;
+            }
             changeRoute({ settings: 'account', assets: false, skills: false, templates: false });
           }}>
-            {t('Claim now')}
+            {t('Sign in')}
             <RemixIcon name="arrow-right-s-line" size={15} aria-hidden="true" />
           </Button>
         </div>
@@ -677,6 +690,53 @@ export function McpConnectionPage({
 
       {/* Main Content Container */}
       <div className="om-mcp-content">
+        {matchedExample && (
+          <section
+            id={`mcp-example-${matchedExample.id}`}
+            tabIndex={-1}
+            className="om-card om-card-stack"
+            data-mcp-featured-example={matchedExample.id}
+            aria-label={t(matchedExample.title)}
+          >
+            <div className="om-settings-row">
+              <div className="om-control-row">
+                <span className="om-badge" data-active="true">{agent} · OpenMotion MCP</span>
+                {'tag' in matchedExample && typeof matchedExample.tag === 'string' && matchedExample.tag ? <span className="om-badge">{t(matchedExample.tag)}</span> : null}
+              </div>
+              <Button
+                variant="plain"
+                className="om-nav-item"
+                onClick={() => changeRoute({ explore: true, settings: null, mcpExample: null })}
+              >
+                <RemixIcon name="arrow-left-line" size={15} aria-hidden="true" />
+                {t('Back to Explore')}
+              </Button>
+            </div>
+            <h2 className="om-subtitle">{t(matchedExample.title)}</h2>
+            <p className="om-muted">{t(matchedExample.description)}</p>
+            <pre className="om-code-block">{t(matchedExample.prompt)}</pre>
+            <div className="om-control-row">
+              <Button
+                variant="ghost"
+                className="om-button h-auto"
+                data-primary
+                onClick={() => void copyCapability(matchedExample)}
+              >
+                <RemixIcon name="file-copy-line" size={15} aria-hidden="true" />
+                {t('Copy prompt')}
+              </Button>
+              <Button
+                variant="ghost"
+                className="om-button h-auto"
+                onClick={() => heading.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })}
+              >
+                <RemixIcon name="plug-line" size={15} aria-hidden="true" />
+                {t('Configure {agent}', { agent })}
+              </Button>
+            </div>
+          </section>
+        )}
+
         {/* Hero Lower: Left 4-Step Rail + Right Visual Stage + Full-Width Prompt Bar */}
         <McpHeroShowcaseStage
           enabled={previewsEnabled}

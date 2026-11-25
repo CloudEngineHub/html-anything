@@ -69,6 +69,7 @@ import { isWorkspacePageOpen, resolveNavTrackingPage, resolveRouteArrival } from
 import { RouteViewport } from '../router/RouteViewport';
 import { OverlayLayer } from '../router/OverlayLayer';
 import { EntitlementModalHost } from './EntitlementModalHost';
+import { hasEntitlementModalListeners, openEntitlementModal, useCloudWebMode } from './entitlementModalBus';
 import { StudioRouterProvider } from '../router/createAppRouter';
 import { useWorkspaceBlocker } from '../router/useWorkspaceBlocker';
 import { isNotFoundSpaPath } from '../../../shared/spa-routes';
@@ -393,7 +394,19 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
     };
     window.addEventListener('keydown', key); return () => window.removeEventListener('keydown', key);
   }, [editorActive, openSettings, toggleSidebar]);
+  const cloudWeb = useCloudWebMode();
   const guestMode = Boolean(workspace.authRequired);
+  useEffect(() => {
+    if (!guestMode || typeof window === 'undefined') return;
+    if (!window.location.hash.startsWith('#project/')) return;
+    if (!page.explore && !page.motion && !page.settings && !page.assets && !page.studio) return;
+    const cleanUrl = `${window.location.pathname}${window.location.search}`;
+    try {
+      window.history.replaceState(window.history.state, '', cleanUrl);
+    } catch {
+      // Ignore history API restrictions in embedded frames.
+    }
+  }, [guestMode, page.explore, page.motion, page.settings, page.assets, page.studio]);
   const startGuestSignIn = useCallback((intent: GuestSignInIntent) => {
     const returnTo = currentReturnToPath();
     saveAuthPendingDraft({
@@ -404,13 +417,21 @@ function WorkspaceFrameInner({ children, waitForSaves, projectId, sessionId, blo
       returnTo,
       autoResume: true,
     });
+    if (cloudWeb && !isDesktopApp() && hasEntitlementModalListeners()) {
+      openEntitlementModal({
+        mode: 'guest',
+        hookId: intent.action === 'use_template' ? 'template_use' : 'header_signin',
+        returnTo,
+      });
+      return;
+    }
     const loginUrl = buildLoginUrl(returnTo);
     if (isDesktopApp()) {
       void startDesktopBrowserLogin({ loginUrl, returnTo });
     } else {
       window.location.assign(loginUrl);
     }
-  }, []);
+  }, [cloudWeb]);
   const resumePendingDraft = useCallback(async (draft: AuthPendingDraft): Promise<boolean> => {
     if (draft.action === 'use_template' && draft.templateId) {
       return sessionId
