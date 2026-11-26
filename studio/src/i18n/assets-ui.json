@@ -259,7 +259,7 @@
     "Retry saving": "重试保存",
     "The retained files are missing, changed or unreadable. Saving cannot be retried. No new generation was requested.": "保留文件已缺失、发生变化或无法读取，不能再重试保存。本次没有重新生成。",
     "Retrying save…": "正在重试保存…",
-    "Generated files are kept locally. Retry saving without generating again.": "生成文件已保留在本机，可重试保存，无需重新生成。",
+    "Retry saving without generating again.": "可重试保存，无需重新生成。",
     "Failure details": "查看失败原因",
     "Asset preview": "资产预览",
     "Asset details": "资产详情",
@@ -353,6 +353,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "请删减 {count} 个字符，以不超过当前上限（{limit} 字符）。"
   },
   "ja": {
+    "Retry saving without generating again.": "再生成せずに保存をやり直せます。",
     "Follows first frame": "最初のフレームに合わせる",
     "Aspect ratio follows the first frame.": "縦横比は最初のフレームに合わせます。",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "最初のフレームがある場合、固定の縦横比は選べません。削除するとテキスト動画の縦横比設定に戻ります。",
@@ -390,6 +391,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "上限（{limit} 文字）以内に収めるには {count} 文字削除してください。"
   },
   "ko": {
+    "Retry saving without generating again.": "다시 생성하지 않고 저장을 재시도할 수 있습니다.",
     "Follows first frame": "첫 프레임에 맞춤",
     "Aspect ratio follows the first frame.": "화면 비율은 첫 프레임을 따릅니다.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "첫 프레임이 첨부되면 고정 비율을 선택할 수 없습니다. 제거하면 텍스트 동영상의 비율 선택이 복원됩니다.",
@@ -427,6 +429,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "{limit}자 제한에 맞추려면 {count}자를 줄여 주세요."
   },
   "de": {
+    "Retry saving without generating again.": "Erneut speichern, ohne neu zu generieren.",
     "Follows first frame": "Wie das erste Bild",
     "Aspect ratio follows the first frame.": "Das Seitenverhältnis richtet sich nach dem ersten Bild.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "Mit einem ersten Bild sind feste Seitenverhältnisse nicht verfügbar. Entfernen Sie es, um die Auswahl für Text-zu-Video wiederherzustellen.",
@@ -464,6 +467,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "Entferne {count} Zeichen, um das Limit von {limit} Zeichen einzuhalten."
   },
   "fr": {
+    "Retry saving without generating again.": "Réessayez d’enregistrer sans relancer la génération.",
     "Follows first frame": "Selon la première image",
     "Aspect ratio follows the first frame.": "Le format suit celui de la première image.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "Les formats fixes sont indisponibles lorsqu’une première image est jointe. Retirez-la pour retrouver votre choix texte-vers-vidéo.",
@@ -501,6 +505,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "Supprimez {count} caractères pour respecter la limite de {limit} caractères."
   },
   "ru": {
+    "Retry saving without generating again.": "Повторите попытку сохранения без повторной генерации.",
     "Follows first frame": "По первому кадру",
     "Aspect ratio follows the first frame.": "Соотношение сторон определяется первым кадром.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "При добавленном первом кадре фиксированные пропорции недоступны. Удалите его, чтобы восстановить выбор пропорций для видео из текста.",
@@ -538,6 +543,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "Удалите {count} симв., чтобы уложиться в лимит {limit} символов."
   },
   "es": {
+    "Retry saving without generating again.": "Vuelve a intentar guardar sin generar de nuevo.",
     "Follows first frame": "Según el primer fotograma",
     "Aspect ratio follows the first frame.": "La relación de aspecto sigue al primer fotograma.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "Las proporciones fijas no están disponibles con un primer fotograma adjunto. Elimínelo para recuperar la proporción de texto a vídeo.",
@@ -575,6 +581,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "Elimina {count} caracteres para no superar el límite de {limit} caracteres."
   },
   "pt-BR": {
+    "Retry saving without generating again.": "Tente salvar novamente sem gerar de novo.",
     "Follows first frame": "Conforme o primeiro quadro",
     "Aspect ratio follows the first frame.": "A proporção segue o primeiro quadro.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "As proporções fixas ficam indisponíveis com um primeiro quadro anexado. Remova-o para restaurar a proporção de texto para vídeo.",
@@ -612,6 +619,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "Remova {count} caracteres para ficar dentro do limite de {limit} caracteres."
   },
   "it": {
+    "Retry saving without generating again.": "Riprova a salvare senza generare di nuovo.",
     "Follows first frame": "Come il primo fotogramma",
     "Aspect ratio follows the first frame.": "Le proporzioni seguono il primo fotogramma.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "Le proporzioni fisse non sono disponibili con un primo fotogramma allegato. Rimuovilo per ripristinare la scelta per il video da testo.",
@@ -649,6 +657,7 @@
     "Remove {count} characters to stay within the {limit}-character limit.": "Rimuovi {count} caratteri per restare entro il limite di {limit} caratteri."
   },
   "tr": {
+    "Retry saving without generating again.": "Yeniden oluşturmadan kaydetmeyi tekrar deneyin.",
     "Follows first frame": "İlk kareye göre",
     "Aspect ratio follows the first frame.": "En boy oranı ilk kareyi izler.",
     "Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.": "İlk kare eklendiğinde sabit oranlar kullanılamaz. Metinden video oranını geri yüklemek için ilk kareyi kaldırın.",
