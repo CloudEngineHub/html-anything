@@ -7,9 +7,20 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { and, eq } from 'drizzle-orm';
 import sharp from 'sharp';
+import {
+  CANVAS_DIMENSIONS,
+  checkOutputResolutionCompatibility,
+  fpsToNumber,
+  isAspectAgnosticResolutionAlias,
+  normalizeResolutionFlag,
+  parseFps,
+  suggestMatchingPreset,
+} from '@hyperframes/core';
 import { extractStandaloneEntryFromIndex } from '@hyperframes/core/compiler';
+import { validateExportExpectation } from '../../shared/export-spec.ts';
 import {
   pluginRoot,
+  resolveTemplateDefaultFps,
   runHyperframesIsolated,
   snapshotExportExpectationIsolated,
   type CommandResult,
@@ -756,6 +767,17 @@ const SAFE_FPS_STRING = /^\d{1,6}(?:\/\d{1,6})?$/;
 const SAFE_RESOLUTION_PRESET = /^[a-z0-9-]{2,32}$/i;
 const SAFE_BITRATE_STRING = /^\d+(?:\.\d+)?[kKmM]?$/;
 
+function extractValidFpsSetting(settings?: Record<string, unknown>): string | undefined {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return undefined;
+  if (typeof settings.fps === 'number' && Number.isFinite(settings.fps) && settings.fps >= 1 && settings.fps <= 240) {
+    return String(settings.fps);
+  }
+  if (typeof settings.fps === 'string' && SAFE_FPS_STRING.test(settings.fps.trim())) {
+    return settings.fps.trim();
+  }
+  return undefined;
+}
+
 /**
  * Build validated CLI arguments for `hyperframes@0.9.7 render`, forwarding only safe
  * allowlisted `payload.settings` (`fps`, `quality`, `resolution`, `crf`, `videoBitrate`,
@@ -785,17 +807,20 @@ export function buildRenderExportArgs(params: {
 
   const settings = params.settings;
   if (settings && typeof settings === 'object' && !Array.isArray(settings)) {
-    if (typeof settings.fps === 'number' && Number.isFinite(settings.fps) && settings.fps >= 1 && settings.fps <= 240) {
-      args.push('--fps', String(settings.fps));
-    } else if (typeof settings.fps === 'string' && SAFE_FPS_STRING.test(settings.fps.trim())) {
-      args.push('--fps', settings.fps.trim());
+    const explicitFps = extractValidFpsSetting(settings);
+    if (explicitFps) {
+      args.push('--fps', explicitFps);
     }
 
     if (typeof settings.quality === 'string' && ALLOWED_RENDER_QUALITIES.has(settings.quality.trim())) {
       args.push('--quality', settings.quality.trim());
     }
 
-    if (typeof settings.resolution === 'string' && SAFE_RESOLUTION_PRESET.test(settings.resolution.trim())) {
+    if (
+      typeof settings.resolution === 'string' &&
+      settings.resolution.trim().toLowerCase() !== 'auto' &&
+      SAFE_RESOLUTION_PRESET.test(settings.resolution.trim())
+    ) {
       args.push('--resolution', settings.resolution.trim());
     }
 
@@ -848,6 +873,63 @@ export function buildRenderExportArgs(params: {
   }
 
   return args;
+}
+
+/**
+ * Apply explicit CLI render overrides (`--fps`, `--resolution`) from `payload.settings` onto the
+ * HTML-derived `ExportExpectation` so post-render verification matches the actual rendered output.
+ */
+export function applyRenderSettingsToExpectation(
+  base: ExportExpectation,
+  settings?: Record<string, unknown>,
+): ExportExpectation {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    return base;
+  }
+
+  let { width, height, fps } = base;
+
+  const rawFps = extractValidFpsSetting(settings);
+  if (rawFps) {
+    const parsedFps = parseFps(rawFps);
+    if (parsedFps.ok) {
+      fps = fpsToNumber(parsedFps.value);
+    }
+  }
+
+  const rawResolution =
+    typeof settings.resolution === 'string' &&
+    settings.resolution.trim().toLowerCase() !== 'auto' &&
+    SAFE_RESOLUTION_PRESET.test(settings.resolution.trim())
+      ? settings.resolution.trim()
+      : undefined;
+  if (rawResolution) {
+    let preset = normalizeResolutionFlag(rawResolution);
+    if (preset && isAspectAgnosticResolutionAlias(rawResolution)) {
+      const adapted = suggestMatchingPreset(width, height, preset);
+      if (adapted) preset = adapted;
+    }
+    if (preset) {
+      const compat = checkOutputResolutionCompatibility({
+        compositionWidth: width,
+        compositionHeight: height,
+        outputResolution: preset,
+      });
+      if (compat.ok) {
+        const target = CANVAS_DIMENSIONS[preset];
+        const scale = Math.max(target.width / width, target.height / height);
+        width = Math.round(width * scale);
+        height = Math.round(height * scale);
+      }
+    }
+  }
+
+  return validateExportExpectation({
+    ...base,
+    width,
+    height,
+    fps,
+  });
 }
 
 /**
@@ -929,7 +1011,12 @@ export async function processExportRenderJob(
   const ephemeralHomeDir = path.join(renderRootDir, 'home');
   const ephemeralTmpDir = path.join(renderRootDir, 'tmp');
   const outputDir = path.join(renderRootDir, 'out');
-  const safeOutputName = path.basename(payload.outputName).replace(/[^a-zA-Z0-9._-]/g, '_') || `export.${format}`;
+  const safeOutputName =
+    path
+      .basename(payload.outputName)
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .replace(/\.{2,}/g, '.')
+      .replace(/^\.+|\.+$/g, '') || `export.${format}`;
   const outputFilePath = path.join(outputDir, safeOutputName);
 
   const claimToken = randomUUID();
@@ -1099,11 +1186,25 @@ export async function processExportRenderJob(
       source: captureTuning.source,
     });
 
+    // hyperframes@0.9.7 CLI's readCompositionFps does not descend into <template> content, so
+    // without an explicit --fps it silently defaults to 30 fps even when the template scene or
+    // its index.html host shell declares another data-fps. Forward the authored default so CLI
+    // rendering and post-render expectation verification always agree.
+    let renderSettings = payload.settings;
+    if (compositionPath !== 'index.html' && !extractValidFpsSetting(payload.settings)) {
+      const templateDefaultFps = await resolveTemplateDefaultFps(runtimeRoot, projectDir, compositionPath).catch(
+        () => undefined,
+      );
+      if (templateDefaultFps) {
+        renderSettings = { ...(payload.settings ?? {}), fps: templateDefaultFps };
+      }
+    }
+
     const renderArgs = buildRenderExportArgs({
       compositionPath,
       outputFilePath,
       format,
-      settings: payload.settings,
+      settings: renderSettings,
       workers: captureTuning.workers,
       disableLowMemoryMode: captureTuning.disableLowMemoryMode,
       disableBrowserGpu: captureTuning.disableBrowserGpu,
@@ -1221,15 +1322,18 @@ export async function processExportRenderJob(
       failureCode = 'EXPORT_VERIFICATION_FAILED';
       await checkpointStage('verifying', 88);
 
-      const expectation =
-        payload.expected ??
-        (deps.extractExpectationFn
-          ? await deps.extractExpectationFn(runtimeRoot, projectDir, compositionPath)
-          : await snapshotExportExpectationIsolated(runtimeRoot, projectDir, compositionPath, {
-              env: renderEnv,
-              timeoutMs: 60_000,
-              signal: abortController.signal,
-            }));
+      const expectation = payload.expected
+        ? payload.expected
+        : applyRenderSettingsToExpectation(
+            deps.extractExpectationFn
+              ? await deps.extractExpectationFn(runtimeRoot, projectDir, compositionPath)
+              : await snapshotExportExpectationIsolated(runtimeRoot, projectDir, compositionPath, {
+                  env: renderEnv,
+                  timeoutMs: 60_000,
+                  signal: abortController.signal,
+                }),
+            payload.settings,
+          );
 
       const verifyFn =
         deps.verifyExportFn ??
