@@ -394,4 +394,40 @@ describe('Cloud Phase 1 feature gates', () => {
     expect(container.querySelector('input[aria-label="Custom voice ID"]')).toBeNull();
     expect(container.textContent).not.toContain('Custom voice ID');
   });
+
+  it('hides the Sound effects tab, type filter, and landing SFX templates in Cloud P1', async () => {
+    await mountApp('/audio/music');
+
+    const soundTabs = [...container.querySelectorAll<HTMLButtonElement>('button[data-sound-tab]')].map(
+      el => el.dataset.soundTab,
+    );
+    expect(soundTabs).toContain('music');
+    expect(soundTabs).toContain('speech');
+    expect(soundTabs).not.toContain('sfx');
+
+    const filterGroup = container.querySelector('[role="group"][aria-label="Audio type"]');
+    expect(filterGroup).not.toBeNull();
+    const filterLabels = [...filterGroup!.querySelectorAll<HTMLButtonElement>('button')].map(el => el.textContent?.trim());
+    expect(filterLabels).toEqual(['All', 'Music', 'Speech']);
+    expect(filterLabels).not.toContain('Sound effects');
+
+    await mountApp('/sound', 1);
+    const titles = [...container.querySelectorAll('.om-audio-card strong')].map(el => el.textContent?.trim());
+    expect(titles).toContain('Minimal product score');
+    expect(titles).not.toContain('Notification chime');
+    expect(titles).not.toContain('Success sound');
+  });
+
+  it.each([
+    ['/audio/sfx', '/audio/music'],
+    ['/sound/sfx', '/sound/music'],
+  ])('redirects direct Cloud P1 navigation from %s to %s via replace', async (blockedPath, expectedPath) => {
+    const historyLengthBefore = history.length;
+    await mountApp(blockedPath);
+
+    expect(location.pathname).toBe(expectedPath);
+    expect(history.length).toBe(historyLengthBefore);
+    expect(container.querySelector('button[data-sound-tab="sfx"]')).toBeNull();
+    expect(container.querySelector('.om-sound-tab[aria-current="page"]')?.getAttribute('data-sound-tab')).toBe('music');
+  });
 });
