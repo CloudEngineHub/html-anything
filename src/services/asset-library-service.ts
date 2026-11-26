@@ -33,7 +33,6 @@ import { idempotencyReceipts, jobs } from '../db/schema/jobs.ts';
 import {
   projectFiles,
   projectVersionFiles,
-  projectVersions,
 } from '../db/schema/project-files.ts';
 import { projects } from '../db/schema/projects.ts';
 import type { QueueService } from '../infra/queues.ts';
@@ -46,6 +45,10 @@ import {
   workspaceBlobKey,
 } from '../infra/storage.ts';
 import { loadProjectOrThrow } from './project-files-service.ts';
+import {
+  commitProjectVersionAndHistory,
+  resolveProjectHistoryActor,
+} from './project-snapshot.ts';
 
 export const MAX_FONT_LICENSE_BYTES = 131_072; // 128 KiB per Spike 2 §3.2.5
 export const DEFAULT_UPLOAD_TICKET_TTL_SEC = 900;
@@ -559,79 +562,67 @@ export class AssetLibraryService {
               hash: f.sha256,
             }));
             const nextRevision = computeProjectRevision(sourceFiles);
-            const nextVersionNumber = project.currentVersionNumber + 1;
+            const summary = `Instant import ${filename}`.slice(0, 256);
+            const historyActor = resolveProjectHistoryActor(ctx);
 
-            const [newVersion] = await tx
-              .insert(projectVersions)
-              .values(
-                asInsert(projectVersions, {
-                  workspaceId: ctx.workspaceId,
-                  projectId: targetProjectId,
-                  versionNumber: nextVersionNumber,
-                  revision: nextRevision,
-                  source: 'studio',
-                  summary: `Instant import ${filename}`.slice(0, 256),
-                  requestId: input.requestId ? input.requestId.slice(0, 128) : null,
-                }),
-              )
-              .returning();
+            const snapshot = await commitProjectVersionAndHistory(tx, {
+              workspaceId: ctx.workspaceId,
+              projectId: targetProjectId,
+              currentVersionNumber: project.currentVersionNumber,
+              currentHistorySeq: project.currentHistorySeq,
+              revision: nextRevision,
+              source: 'studio',
+              summary,
+              requestId: input.requestId ? input.requestId.slice(0, 128) : null,
+              actorKind: historyActor.actorKind,
+              actorName: historyActor.actorName,
+              afterVersionInsert: async (versionId) => {
+                for (const file of nextFiles) {
+                  await tx.insert(projectVersionFiles).values(
+                    asInsert(projectVersionFiles, {
+                      versionId,
+                      workspaceId: ctx.workspaceId,
+                      projectId: targetProjectId,
+                      path: file.path,
+                      blobScope: file.blobScope,
+                      sha256: file.sha256,
+                      sizeBytes: Number(file.sizeBytes),
+                      mimeType: file.mimeType,
+                    }),
+                  );
+                }
 
-            for (const file of nextFiles) {
-              await tx.insert(projectVersionFiles).values(
-                asInsert(projectVersionFiles, {
-                  versionId: newVersion.id,
-                  workspaceId: ctx.workspaceId,
-                  projectId: targetProjectId,
-                  path: file.path,
-                  blobScope: file.blobScope,
-                  sha256: file.sha256,
-                  sizeBytes: Number(file.sizeBytes),
-                  mimeType: file.mimeType,
-                }),
-              );
-            }
-
-            const deltas: BlobRefDelta[] = [
-              {
-                sha256: blob.sha256,
-                delta: 1,
-                sizeBytes: Number(blob.sizeBytes),
-                mimeType: resolvedMime,
+                const deltas: BlobRefDelta[] = [
+                  {
+                    sha256: blob.sha256,
+                    delta: 1,
+                    sizeBytes: Number(blob.sizeBytes),
+                    mimeType: resolvedMime,
+                  },
+                ];
+                if (replaced && replaced.blobScope === 'workspace') {
+                  deltas.push({ sha256: replaced.sha256, delta: -1 });
+                }
+                for (const file of nextFiles) {
+                  if (file.blobScope === 'workspace') {
+                    deltas.push({
+                      sha256: file.sha256,
+                      delta: 1,
+                      sizeBytes: Number(file.sizeBytes),
+                      mimeType: file.mimeType,
+                    });
+                  }
+                }
+                await applyWorkspaceBlobRefDeltas(tx, ctx.workspaceId, deltas);
               },
-            ];
-            if (replaced && replaced.blobScope === 'workspace') {
-              deltas.push({ sha256: replaced.sha256, delta: -1 });
-            }
-            for (const file of nextFiles) {
-              if (file.blobScope === 'workspace') {
-                deltas.push({
-                  sha256: file.sha256,
-                  delta: 1,
-                  sizeBytes: Number(file.sizeBytes),
-                  mimeType: file.mimeType,
-                });
-              }
-            }
-            await applyWorkspaceBlobRefDeltas(tx, ctx.workspaceId, deltas);
-
-            await tx
-              .update(projects)
-              .set(
-                asUpdate(projects, {
-                  revision: nextRevision,
-                  currentVersionId: newVersion.id,
-                  currentVersionNumber: nextVersionNumber,
-                  updatedAt: sql`now()`,
-                }),
-              )
-              .where(and(eq(projects.workspaceId, ctx.workspaceId), eq(projects.id, targetProjectId)));
+            });
 
             const resultPayload = {
               instantCommitted: true,
               projectPath: validatedTargetPath,
               sha256: blob.sha256,
               projectRevision: nextRevision,
-              projectVersionId: newVersion.id,
+              projectVersionId: snapshot.versionId,
             };
             await tx.insert(uploadTickets).values(
               asInsert(uploadTickets, {
@@ -655,10 +646,11 @@ export class AssetLibraryService {
               }),
             );
 
-            return { nextRevision, versionId: newVersion.id };
+            return { nextRevision, versionId: snapshot.versionId, historySeq: snapshot.historySeq };
           });
 
           if (this.eventBus) {
+            const ts = Date.now();
             const evt: ProjectEvent = {
               type: 'file-change',
               workspaceId: ctx.workspaceId,
@@ -667,9 +659,19 @@ export class AssetLibraryService {
               versionId: committed.versionId,
               paths: [validatedTargetPath],
               affectsPreview: true,
-              ts: Date.now(),
+              ts,
             };
             await this.eventBus.publish(projectChannel(ctx.workspaceId, targetProjectId), evt).catch(() => {});
+            const historyEvt: ProjectEvent = {
+              type: 'history-changed',
+              workspaceId: ctx.workspaceId,
+              projectId: targetProjectId,
+              revision: committed.nextRevision,
+              versionId: committed.versionId,
+              historySeq: committed.historySeq,
+              ts,
+            };
+            await this.eventBus.publish(projectChannel(ctx.workspaceId, targetProjectId), historyEvt).catch(() => {});
           }
 
           return {
