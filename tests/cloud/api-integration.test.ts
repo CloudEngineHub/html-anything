@@ -44,6 +44,7 @@ import { parseConfig, type AppConfig } from '../../src/infra/config.ts';
 import { createLogger } from '../../src/infra/logger.ts';
 import { InMemoryMcpSessionStore } from '../../src/mcp/index.ts';
 import { MockModelGateway } from '../../src/services/mock-model-adapter.ts';
+import { ProjectArchiveService } from '../../src/services/project-archive-service.ts';
 import type { WelcomeBootstrapService } from '../../src/services/welcome-bootstrap.ts';
 import { processMediaGenerateJob } from '../../src/workers/media-generate.ts';
 
@@ -511,9 +512,9 @@ function evalW(row: Row, raw: string, params: unknown[]): boolean {
   if ((m = /^([\s\S]+?)\s+in\s*\(([\s\S]+)\)$/i.exec(term))) {
     return splitTop(m[2], ',').map((v) => evalSc(v, params)).includes(row[colName(m[1])]);
   }
-  if ((m = /^([\s\S]+?)\s*>=\s*([\s\S]+)$/.exec(term))) return Number(row[colName(m[1])]) >= Number(evalSc(m[2], params));
-  if ((m = /^([\s\S]+?)\s*>\s*([\s\S]+)$/.exec(term))) return Number(row[colName(m[1])]) > Number(evalSc(m[2], params));
-  if ((m = /^([\s\S]+?)\s*<\s*([\s\S]+)$/.exec(term))) return Number(row[colName(m[1])]) < Number(evalSc(m[2], params));
+  if ((m = /^([\s\S]+?)\s*>=\s*([\s\S]+)$/.exec(term))) return sortVal(row[colName(m[1])]) >= sortVal(evalSc(m[2], params));
+  if ((m = /^([\s\S]+?)\s*>\s*([\s\S]+)$/.exec(term))) return sortVal(row[colName(m[1])]) > sortVal(evalSc(m[2], params));
+  if ((m = /^([\s\S]+?)\s*<\s*([\s\S]+)$/.exec(term))) return sortVal(row[colName(m[1])]) < sortVal(evalSc(m[2], params));
   if ((m = /^([\s\S]+?)\s*=\s*([\s\S]+)$/.exec(term))) return row[colName(m[1])] === evalSc(m[2], params);
   throw new Error(`Unsupported WHERE: ${term}`);
 }
@@ -540,6 +541,7 @@ function applySet(row: Row, setC: string, params: unknown[]): void {
 }
 function sortVal(v: unknown): string | number {
   if (typeof v === 'number') return v;
+  if (v instanceof Date) return v.getTime();
   if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) return Date.parse(v);
   return String(v ?? '');
 }
@@ -1472,6 +1474,7 @@ describe('Cloud API Entrypoint — Auth Isolation & First-Access Welcome Bootstr
       '/motion-api/models/defaults',
       '/motion-api/account/summary',
       '/motion-api/integration',
+      `/motion-api/project-archives/${randomUUID()}/file`,
     ]) {
       const res = await app.request(url);
       assert.equal(res.status, 401, `expected 401 for unauthenticated ${url}`);
@@ -1532,7 +1535,7 @@ describe('Cloud API Entrypoint — Auth Isolation & First-Access Welcome Bootstr
     assert.equal(publicConfigRes.status, 200);
     assert.match(await publicConfigRes.text(), /https:\/\/motion\.example\.test\/mcp/);
 
-    // Unauthenticated /mcp returns 401 with structured authGuidance pointing to /install.md
+    // Unauthenticated /mcp distinguishes Agent instructions from human setup help.
     const unauthMcpRes = await app.request('/mcp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1540,11 +1543,17 @@ describe('Cloud API Entrypoint — Auth Isolation & First-Access Welcome Bootstr
     });
     assert.equal(unauthMcpRes.status, 401);
     const unauthMcpBody = (await unauthMcpRes.json()) as {
-      authGuidance?: { preferred?: string; installGuideUrl?: string; connectPageUrl?: string };
+      authGuidance?: {
+        preferred?: string; installGuideUrl?: string; installGuideAudience?: string;
+        connectPageUrl?: string; postAuthorizationInstructions?: string;
+      };
     };
     assert.equal(unauthMcpBody.authGuidance?.preferred, 'oauth2.1');
     assert.equal(unauthMcpBody.authGuidance?.installGuideUrl, 'https://motion.example.test/install.md');
+    assert.equal(unauthMcpBody.authGuidance?.installGuideAudience, 'agent');
     assert.equal(unauthMcpBody.authGuidance?.connectPageUrl, 'https://motion.example.test/mcp-setup');
+    assert.match(unauthMcpBody.authGuidance?.postAuthorizationInstructions ?? '', /a new chat in this client/);
+    assert.doesNotMatch(unauthMcpBody.authGuidance?.postAuthorizationInstructions ?? '', /\bCodex\b/);
 
     // OAuth 2.1 discovery endpoints are public
     const prmRes = await app.request('/.well-known/oauth-protected-resource');
@@ -1755,9 +1764,33 @@ describe('Cloud API Entrypoint — End-to-End Product, Studio & Streamable HTTP 
 
     // 4. tools/list must advertise all 22 registered domain openmotion_* tools
     const listPayload = await callMcp(2, 'tools/list');
-    const tools = (listPayload.result?.tools ?? []) as Array<{ name: string; description: string }>;
+    const tools = (listPayload.result?.tools ?? []) as Array<{
+      name: string;
+      description: string;
+      inputSchema: { properties: { action?: { enum: string[] }; sourcePath?: unknown } };
+    }>;
     assert.equal(tools.length, phase1Tools.length);
     assert.equal(tools.length, 22);
+    const archiveTool = tools.find(tool => tool.name === 'openmotion_project_archive');
+    assert.ok(archiveTool);
+    assert.deepEqual(archiveTool.inputSchema.properties.action?.enum, ['export']);
+    assert.equal(archiveTool.inputSchema.properties.sourcePath, undefined);
+    assert.doesNotMatch(archiveTool.description, /sourcePath|local ZIP path/);
+    assert.ok(archiveTool.description.includes(`POST ${config.APP_PUBLIC_ORIGIN}/motion-api/project-archives/import`));
+    assert.match(archiveTool.description, /projects:write/);
+    assert.match(archiveTool.description, /projects:read/);
+
+    const legacyArchive = await callMcp(21, 'tools/call', {
+      name: 'openmotion_project_archive',
+      arguments: { action: 'import', requestId: 'archive-legacy', sourcePath: '/tmp/project.zip' },
+    });
+    assert.equal(legacyArchive.result?.isError, true);
+    const legacyError = (legacyArchive.result?.structuredContent as {
+      error: { status: number; details: { legacyCode: string } };
+    }).error;
+    assert.equal(legacyError.status, 400);
+    assert.equal(legacyError.details.legacyCode, 'LOCAL_PATH_UNSUPPORTED_IN_CLOUD');
+    assert.ok(JSON.stringify(legacyArchive.result).includes(`POST ${config.APP_PUBLIC_ORIGIN}/motion-api/project-archives/import`));
     const transcriptGuide = tools.find(tool => tool.name === 'openmotion_assets_use')?.description;
     assert.ok(transcriptGuide);
     assert.match(transcriptGuide, /Cloud ASR submit\/status is unavailable/);
@@ -3929,6 +3962,13 @@ describe('Cloud API Entrypoint — OAuth Agent Workspace Access & Cross-User Iso
     const workspaceId = config.DEV_WORKSPACE_ID;
     const clientId = 'oauth-client-codex';
     authStore.seedWorkspace({
+      userId: otherUserId,
+      workspaceId,
+      email: 'colleague@example.test',
+      displayName: 'Colleague',
+      role: 'editor',
+    });
+    authStore.seedWorkspace({
       userId,
       workspaceId,
       email: 'owner@example.test',
@@ -4005,6 +4045,10 @@ describe('Cloud API Entrypoint — OAuth Agent Workspace Access & Cross-User Iso
     assert.equal(initRes.status, 200);
     const initJson = (await initRes.json()) as { result?: { instructions?: string } };
     assert.match(initJson.result?.instructions ?? '', /https:\/\/motion\.example\.test/);
+    assert.match(initJson.result?.instructions ?? '', /After authorization, keep \/install\.md internal/);
+    assert.match(initJson.result?.instructions ?? '', /a new chat in this client.*creative request/);
+    assert.doesNotMatch(initJson.result?.instructions ?? '', /open a new Codex chat/);
+    assert.ok(initJson.result?.instructions?.includes(`${config.APP_PUBLIC_ORIGIN}/mcp-setup`));
     const mcpSessionId = initRes.headers.get('mcp-session-id');
     assert.ok(mcpSessionId);
 
@@ -4040,17 +4084,391 @@ describe('Cloud API Entrypoint — OAuth Agent Workspace Access & Cross-User Iso
     });
     assert.equal(prepProjectB.result?.isError, undefined, JSON.stringify(prepProjectB.result));
 
+    // A cloud archive has an absolute, authenticated download URL and can be uploaded through HTTP.
+    const exportArgs = { action: 'export', projectIds: [projectB], requestId: 'archive-export-e2e' };
+    const exported = await callTool(20, 'openmotion_project_archive', exportArgs);
+    assert.equal(exported.result?.isError, undefined, JSON.stringify(exported.result));
+    const archive = exported.result?.structuredContent as {
+      archiveId: string; downloadUrl: string; downloadInstructions: string; bytes: number; sha256: string;
+    };
+    const archiveFile = `/motion-api/project-archives/${archive.archiveId}/file`;
+    assert.equal(archive.downloadUrl, `${config.APP_PUBLIC_ORIGIN}${archiveFile}`);
+    assert.match(archive.downloadInstructions, /OAuth.*PAT.*projects:read/);
+
+    const receipt = pgClient.rows('idempotency_receipts').find(row => row.request_id === exportArgs.requestId)!;
+    receipt.response_payload = { ...(receipt.response_payload as object), downloadUrl: archiveFile };
+    const retried = await callTool(21, 'openmotion_project_archive', exportArgs);
+    assert.deepEqual(retried.result?.structuredContent, { ...archive, replayed: true });
+
+    const archiveHeadResponse = await app.request(archive.downloadUrl, {
+      method: 'HEAD',
+      headers: { Authorization: mcpHeaders.Authorization },
+    });
+    assert.equal(archiveHeadResponse.status, 200);
+    assert.equal(archiveHeadResponse.headers.get('content-length'), String(archive.bytes));
+
+    const archiveResponse = await app.request(archive.downloadUrl, {
+      headers: { Authorization: mcpHeaders.Authorization },
+    });
+    assert.equal(archiveResponse.status, 302);
+    const storageUrl = new URL(archiveResponse.headers.get('location')!);
+    const zip = await fixture.storage.getObjectBuffer(decodeURIComponent(storageUrl.pathname.slice(1)));
+    assert.equal(zip.byteLength, archive.bytes);
+    assert.equal(createHash('sha256').update(zip).digest('hex'), archive.sha256);
+
+    // Another OAuth user in the SAME workspace cannot download (GET/HEAD) or replay User A's archive.
+    const sameWorkspaceOtherToken = `om_oat_${'b'.repeat(40)}`;
+    await authStore.createOAuthToken({
+      clientId: 'oauth-client-other-user',
+      userId: otherUserId,
+      workspaceId,
+      accessTokenHash: createHash('sha256').update(sameWorkspaceOtherToken).digest('hex'),
+      refreshTokenHash: null,
+      scope: DEFAULT_PAT_SCOPES.join(' '),
+      resource: `${config.APP_PUBLIC_ORIGIN}/mcp`,
+      accessExpiresAt: new Date(Date.now() + 3600_000),
+      refreshExpiresAt: null,
+    });
+    const otherOAuthHeaders = {
+      Authorization: `Bearer ${sameWorkspaceOtherToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+    };
+    assert.equal(
+      (await app.request(archive.downloadUrl, { headers: { Authorization: otherOAuthHeaders.Authorization } })).status,
+      404,
+    );
+    assert.equal(
+      (
+        await app.request(archive.downloadUrl, {
+          method: 'HEAD',
+          headers: { Authorization: otherOAuthHeaders.Authorization },
+        })
+      ).status,
+      404,
+    );
+    const otherInitRes = await app.request('/mcp', {
+      method: 'POST',
+      headers: otherOAuthHeaders,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'codex-other-user-test', version: '1.0.0' },
+        },
+      }),
+    });
+    assert.equal(otherInitRes.status, 200);
+    const otherMcpSessionId = otherInitRes.headers.get('mcp-session-id');
+    assert.ok(otherMcpSessionId);
+    const otherReplayRes = await app.request('/mcp', {
+      method: 'POST',
+      headers: { ...otherOAuthHeaders, 'Mcp-Session-Id': otherMcpSessionId },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'openmotion_project_archive', arguments: exportArgs },
+      }),
+    });
+    assert.equal(otherReplayRes.status, 200);
+    const otherReplayJson = (await otherReplayRes.json()) as {
+      result?: { isError?: boolean; structuredContent?: { error?: { code?: string } } };
+    };
+    assert.equal(otherReplayJson.result?.isError, true);
+    assert.equal(otherReplayJson.result?.structuredContent?.error?.code, 'PROJECT_NOT_FOUND');
+
+    // Confirm the same-workspace colleague OAuth token can export and download its own project archive.
+    const otherExportRes = await app.request('/mcp', {
+      method: 'POST',
+      headers: { ...otherOAuthHeaders, 'Mcp-Session-Id': otherMcpSessionId },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'openmotion_project_archive',
+          arguments: { action: 'export', projectIds: [otherUserProject], requestId: 'archive-export-other-user' },
+        },
+      }),
+    });
+    assert.equal(otherExportRes.status, 200);
+    const otherExportJson = (await otherExportRes.json()) as {
+      result?: { isError?: boolean; structuredContent?: { downloadUrl?: string } };
+    };
+    assert.equal(otherExportJson.result?.isError, undefined, JSON.stringify(otherExportJson.result));
+    const otherDownloadUrl = otherExportJson.result?.structuredContent?.downloadUrl!;
+    assert.equal(
+      (await app.request(otherDownloadUrl, { headers: { Authorization: otherOAuthHeaders.Authorization } })).status,
+      302,
+    );
+    assert.equal(
+      (await app.request(otherDownloadUrl, { headers: { Authorization: mcpHeaders.Authorization } })).status,
+      404,
+    );
+
+    // Permanently deleting an exported project must keep the archive readable and replayable by its exporter,
+    // while keeping it inaccessible to other OAuth users in the same workspace.
+    const disposableProj = await createProj('Disposable Export Project');
+    const disposableExportArgs = {
+      action: 'export',
+      projectIds: [disposableProj],
+      requestId: 'archive-export-survives-delete',
+    };
+    const disposableExportRes = await callTool(22, 'openmotion_project_archive', disposableExportArgs);
+    assert.equal(disposableExportRes.result?.isError, undefined, JSON.stringify(disposableExportRes.result));
+    const disposableArchive = disposableExportRes.result?.structuredContent as {
+      archiveId: string; downloadUrl: string;
+    };
+    const disposableRowIdx = pgClient.rows('projects').findIndex((row) => row.id === disposableProj);
+    assert.ok(disposableRowIdx >= 0);
+    pgClient.rows('projects').splice(disposableRowIdx, 1);
+
+    assert.equal(
+      (await app.request(disposableArchive.downloadUrl, { method: 'HEAD', headers: { Authorization: mcpHeaders.Authorization } })).status,
+      200,
+    );
+    assert.equal(
+      (await app.request(disposableArchive.downloadUrl, { headers: { Authorization: mcpHeaders.Authorization } })).status,
+      302,
+    );
+    const disposableReplay = await callTool(23, 'openmotion_project_archive', disposableExportArgs);
+    assert.equal(disposableReplay.result?.isError, undefined, JSON.stringify(disposableReplay.result));
+    assert.equal((disposableReplay.result?.structuredContent as { replayed?: boolean })?.replayed, true);
+    assert.equal(
+      'ownerUserId' in ((disposableReplay.result?.structuredContent as Record<string, unknown>) ?? {}),
+      false,
+    );
+    assert.equal(
+      (await app.request(disposableArchive.downloadUrl, { headers: { Authorization: otherOAuthHeaders.Authorization } })).status,
+      404,
+    );
+
+    // Sweeping expired archive:export receipts after 30 days must not revoke OAuth download access
+    // for the exporter (nor widen access to other OAuth users in the same workspace).
+    const receiptIdx = pgClient
+      .rows('idempotency_receipts')
+      .findIndex((row) => row.scope === 'archive:export' && row.resource_id === disposableArchive.archiveId);
+    assert.ok(receiptIdx >= 0);
+    pgClient.rows('idempotency_receipts').splice(receiptIdx, 1);
+    assert.equal(
+      (await app.request(disposableArchive.downloadUrl, { method: 'HEAD', headers: { Authorization: mcpHeaders.Authorization } })).status,
+      200,
+    );
+    assert.equal(
+      (await app.request(disposableArchive.downloadUrl, { headers: { Authorization: mcpHeaders.Authorization } })).status,
+      302,
+    );
+    assert.equal(
+      (await app.request(disposableArchive.downloadUrl, { method: 'HEAD', headers: { Authorization: otherOAuthHeaders.Authorization } })).status,
+      404,
+    );
+    assert.equal(
+      (await app.request(disposableArchive.downloadUrl, { headers: { Authorization: otherOAuthHeaders.Authorization } })).status,
+      404,
+    );
+
+    const owner = { ...agent, role: 'owner' as const, authMethod: 'session_cookie' as const };
+    const pat = await createPat(authStore, owner, { name: 'Archive download', scopes: ['projects:read'] });
+    const patHeaders = { Authorization: `Bearer ${pat.token}` };
+    assert.equal((await app.request(archive.downloadUrl, { headers: patHeaders })).status, 302);
+
+    const otherWorkspaceId = randomUUID();
+    authStore.seedWorkspace({ userId: otherUserId, workspaceId: otherWorkspaceId, email: 'other@example.test' });
+    const otherPat = await createPat(authStore, { ...owner, userId: otherUserId, workspaceId: otherWorkspaceId }, {
+      name: 'Another workspace download', scopes: ['projects:read'],
+    });
+    assert.equal((await app.request(archive.downloadUrl, {
+      headers: { Authorization: `Bearer ${otherPat.token}` },
+    })).status, 404);
+
+    const uploadUrl = `${config.APP_PUBLIC_ORIGIN}/motion-api/project-archives/import?requestId=archive-upload-e2e`;
+    const uploadOptions = {
+      method: 'POST', body: new Uint8Array(zip),
+      headers: { Authorization: mcpHeaders.Authorization, 'Content-Type': 'application/zip' },
+    };
+    assert.equal((await app.request(uploadUrl, { ...uploadOptions, headers: patHeaders })).status, 403);
+    const uploaded = await app.request(uploadUrl, uploadOptions);
+    assert.equal(uploaded.status, 201);
+    const imported = (await uploaded.json()) as { imported: Array<{ projectId: string }> };
+    assert.equal(imported.imported.length, 1);
+    assert.notEqual(imported.imported[0].projectId, projectB);
+    const uploadRetry = await app.request(uploadUrl, uploadOptions);
+    assert.equal(uploadRetry.status, 200);
+    assert.deepEqual((await uploadRetry.json() as typeof imported).imported, imported.imported);
+    const otherImportReplay = await app.request(uploadUrl, {
+      ...uploadOptions,
+      headers: { Authorization: otherOAuthHeaders.Authorization, 'Content-Type': 'application/zip' },
+    });
+    assert.equal(otherImportReplay.status, 404);
+
+    // Overlapping ZIP upload retries with the same requestId must claim the receipt atomically and never create duplicate projects.
+    const projectsBeforeRace = pgClient.rows('projects').length;
+    const raceUploadUrl = `${config.APP_PUBLIC_ORIGIN}/motion-api/project-archives/import?requestId=archive-upload-race`;
+    const originalCreateProject = workspace.createProject.bind(workspace);
+    let releaseCreateProject!: () => void;
+    let markCreateProjectEntered!: () => void;
+    const createProjectEntered = new Promise<void>((resolve) => {
+      markCreateProjectEntered = resolve;
+    });
+    const createProjectGate = new Promise<void>((resolve) => {
+      releaseCreateProject = resolve;
+    });
+    let intercepted = false;
+    workspace.createProject = (async (...args: Parameters<typeof workspace.createProject>) => {
+      if (!intercepted) {
+        intercepted = true;
+        markCreateProjectEntered();
+        await createProjectGate;
+      }
+      return originalCreateProject(...args);
+    }) as typeof workspace.createProject;
+    try {
+      const firstUploadPromise = app.request(raceUploadUrl, uploadOptions);
+      await createProjectEntered;
+      const overlappingRetry = await app.request(raceUploadUrl, uploadOptions);
+      assert.equal(overlappingRetry.status, 409);
+      const conflictBody = (await overlappingRetry.json()) as { code?: string };
+      assert.equal(conflictBody.code, 'REQUEST_ID_CONFLICT');
+      releaseCreateProject();
+      const firstUploadRes = await firstUploadPromise;
+      assert.equal(firstUploadRes.status, 201);
+      const firstImported = (await firstUploadRes.json()) as { imported: Array<{ projectId: string }>; replayed: boolean };
+      assert.equal(firstImported.replayed, false);
+      assert.equal(firstImported.imported.length, 1);
+      assert.equal(pgClient.rows('projects').length, projectsBeforeRace + 1);
+      const settledRetry = await app.request(raceUploadUrl, uploadOptions);
+      assert.equal(settledRetry.status, 200);
+      const settledBody = (await settledRetry.json()) as { imported: Array<{ projectId: string }>; replayed: boolean };
+      assert.equal(settledBody.replayed, true);
+      assert.deepEqual(settledBody.imported, firstImported.imported);
+    } finally {
+      workspace.createProject = originalCreateProject;
+    }
+
+    // A stale pending import receipt (e.g. left behind after a worker crash/OOM) can be reclaimed on retry with the same requestId.
+    const completedRaceReceipt = pgClient
+      .rows('idempotency_receipts')
+      .find((row) => row.scope === 'archive:import' && row.request_id === 'archive-upload-race')!;
+    const staleTimestamp = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    pgClient.seed('idempotency_receipts', {
+      workspace_id: workspaceId,
+      scope: 'archive:import',
+      request_id: 'archive-upload-stale',
+      input_hash: completedRaceReceipt.input_hash,
+      state: 'pending',
+      resource_id: null,
+      response_payload: null,
+      created_at: staleTimestamp,
+      updated_at: staleTimestamp,
+      expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+    });
+    const projectsBeforeStale = pgClient.rows('projects').length;
+    const staleUploadUrl = `${config.APP_PUBLIC_ORIGIN}/motion-api/project-archives/import?requestId=archive-upload-stale`;
+    const reclaimedRes = await app.request(staleUploadUrl, uploadOptions);
+    assert.equal(reclaimedRes.status, 201);
+    const reclaimedBody = (await reclaimedRes.json()) as { imported: Array<{ projectId: string }>; replayed: boolean };
+    assert.equal(reclaimedBody.replayed, false);
+    assert.equal(reclaimedBody.imported.length, 1);
+    assert.equal(pgClient.rows('projects').length, projectsBeforeStale + 1);
+    const reclaimedRetry = await app.request(staleUploadUrl, uploadOptions);
+    assert.equal(reclaimedRetry.status, 200);
+    const reclaimedRetryBody = (await reclaimedRetry.json()) as { imported: Array<{ projectId: string }>; replayed: boolean };
+    assert.equal(reclaimedRetryBody.replayed, true);
+    assert.deepEqual(reclaimedRetryBody.imported, reclaimedBody.imported);
+
+    // An active slow import exceeding the lease duration refreshes its lease via heartbeat so
+    // an overlapping retry with the same requestId still gets 409 REQUEST_ID_CONFLICT instead of duplicating projects.
+    const shortLeaseArchive = new ProjectArchiveService({
+      db: drizzle({ client: pgClient as never, schema }) as unknown as Database,
+      storage: fixture.storage,
+      workspace,
+      files: fixture.services.files,
+      publicOrigin: config.APP_PUBLIC_ORIGIN,
+      pendingImportLeaseMs: 80,
+      pendingImportHeartbeatMs: 20,
+    });
+    const projectsBeforeSlow = pgClient.rows('projects').length;
+    const origCreateForSlow = workspace.createProject.bind(workspace);
+    let releaseSlowCreate!: () => void;
+    let markSlowEntered!: () => void;
+    const slowEntered = new Promise<void>((resolve) => {
+      markSlowEntered = resolve;
+    });
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlowCreate = resolve;
+    });
+    let slowIntercepted = false;
+    workspace.createProject = (async (...args: Parameters<typeof workspace.createProject>) => {
+      if (!slowIntercepted) {
+        slowIntercepted = true;
+        markSlowEntered();
+        await slowGate;
+      }
+      return origCreateForSlow(...args);
+    }) as typeof workspace.createProject;
+    try {
+      const slowRequestId = 'archive-upload-lease-refresh';
+      const slowImportPromise = shortLeaseArchive.importProjects(agent, {
+        requestId: slowRequestId,
+        zipBytes: zip,
+      });
+      await slowEntered;
+      const initialReceipt = pgClient
+        .rows('idempotency_receipts')
+        .find((row) => row.scope === 'archive:import' && row.request_id === slowRequestId)!;
+      const initialUpdatedMs =
+        initialReceipt.updated_at instanceof Date
+          ? initialReceipt.updated_at.getTime()
+          : Date.parse(String(initialReceipt.updated_at));
+      // Wait longer than the 80ms lease so the 20ms heartbeat must refresh updated_at to prevent reclaim.
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      const refreshedReceipt = pgClient
+        .rows('idempotency_receipts')
+        .find((row) => row.scope === 'archive:import' && row.request_id === slowRequestId)!;
+      const refreshedUpdatedMs =
+        refreshedReceipt.updated_at instanceof Date
+          ? refreshedReceipt.updated_at.getTime()
+          : Date.parse(String(refreshedReceipt.updated_at));
+      assert.ok(refreshedUpdatedMs > initialUpdatedMs, 'heartbeat must refresh pending receipt updated_at');
+
+      await assert.rejects(
+        shortLeaseArchive.importProjects(agent, { requestId: slowRequestId, zipBytes: zip }),
+        (err: unknown) => err instanceof CloudError && err.code === 'REQUEST_ID_CONFLICT' && err.status === 409,
+      );
+
+      releaseSlowCreate();
+      const slowResult = await slowImportPromise;
+      assert.equal(slowResult.replayed, false);
+      assert.equal(slowResult.imported.length, 1);
+      assert.equal(pgClient.rows('projects').length, projectsBeforeSlow + 1);
+
+      const slowReplay = await shortLeaseArchive.importProjects(agent, {
+        requestId: slowRequestId,
+        zipBytes: zip,
+      });
+      assert.equal(slowReplay.replayed, true);
+      assert.deepEqual(slowReplay.imported, slowResult.imported);
+    } finally {
+      workspace.createProject = origCreateForSlow;
+    }
+
     // 2. Accessing another user's project returns PROJECT_NOT_FOUND with environment diagnostics
     const readOther = await callTool(4, 'openmotion_get_project', { projectId: otherUserProject });
     assert.equal(readOther.result?.isError, true);
     const errObj = readOther.result?.structuredContent?.error as {
       code?: string;
-      details?: { serverOrigin?: string; installGuideUrl?: string; hint?: string };
+      details?: { serverOrigin?: string; installGuideUrl?: string; connectPageUrl?: string; hint?: string };
     };
     assert.equal(errObj?.code, 'PROJECT_NOT_FOUND');
     assert.equal(errObj?.details?.serverOrigin, 'https://motion.example.test');
     assert.equal(errObj?.details?.installGuideUrl, 'https://motion.example.test/install.md');
-    assert.match(errObj?.details?.hint ?? '', /motion\.example\.test/);
+    assert.equal(errObj?.details?.connectPageUrl, 'https://motion.example.test/mcp-setup');
+    assert.match(errObj?.details?.hint ?? '', /motion\.example\.test\/mcp-setup/);
+    assert.doesNotMatch(errObj?.details?.hint ?? '', /\/install\.md/);
 
     const prepOther = await callTool(5, 'openmotion_import_assets', {
       action: 'prepare_upload',
