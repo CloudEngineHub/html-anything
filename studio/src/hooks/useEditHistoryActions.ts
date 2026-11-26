@@ -1,6 +1,7 @@
 // fallow-ignore-file complexity
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { STUDIO_MOTION_PATH } from "../components/editor/studioMotion";
+import { STYLE_HISTORY_PREFIX } from "../i18n/styleHistory";
 import { serializeStudioFileMutations } from "../utils/studioFileMutationCoordinator";
 import type { RestoreFiles } from "../utils/gsapUndoRestore";
 import { whileScriptWrites } from "../player/previewReloading";
@@ -217,7 +218,10 @@ export function useEditHistoryActions({
           forceReloadSdkSession?.();
         }
         await syncHistoryPreviewAfterApply(restore);
-        showToast(result.label, "info");
+        const message = result.label.startsWith(STYLE_HISTORY_PREFIX)
+          ? `${direction === "undo" ? "Undid" : "Redid"}: ${result.label}`
+          : result.label;
+        showToast(message, "info");
       }
     },
     [
