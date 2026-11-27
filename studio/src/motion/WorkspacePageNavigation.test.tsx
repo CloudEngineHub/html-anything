@@ -58,9 +58,6 @@ async function accountAction(label: string) {
 async function openMcp() {
   await click('MCP');
 }
-async function clickWorkspaceBack() {
-  await act(async () => { button('Back').click(); await new Promise(resolve => setTimeout(resolve, 0)); });
-}
 const traverse = async (delta: number) => { await act(async () => { history.go(delta); await new Promise(resolve => setTimeout(resolve, 0)); }); };
 const settingsBack = () => container.querySelector<HTMLButtonElement>('.om-settings-heading > button.om-nav-item');
 const leaveSettings = async () => {
@@ -1653,16 +1650,19 @@ it('keeps Agent Skills available while the 3D studio is pending and preserves th
   await act(async () => feed.querySelector<HTMLButtonElement>('.om-scene-tile')!.click());
   expect(page()).toMatchObject({ specialty: { id: '3d' }, skill: 'three-js', community: '3d-motion' });
   expect(container.querySelector('.om-studio-coming-soon')).toBeNull();
-  expect(container.querySelector('.om-specialty-intro .om-specialty-status')?.textContent).toBe('Coming soon');
-  expect(container.querySelector<HTMLAnchorElement>('.om-specialty-intro .om-coming-soon-actions a')?.href).toBe('https://github.com/nexu-io/openmotion');
-  expect(container.querySelector('.om-specialty-intro .om-specialty-actions')).toBeNull();
+  const banner = container.querySelector('.om-studio-landing-hero')!;
+  expect(banner.querySelector('h1')?.textContent).toBe('3D Studio');
+  expect(banner.querySelector('.om-coming-soon-status')?.textContent).toBe('Coming soon');
+  expect(banner.querySelector<HTMLAnchorElement>('.om-coming-soon-actions a')?.href).toBe('https://github.com/nexu-io/openmotion');
+  expect(banner.querySelector('[data-primary="media"]')).toBeNull();
   expect(container.querySelector('.om-studio-template-shelf')).not.toBeNull();
   expect([...container.querySelectorAll('.om-skills-grid [data-skill-id]')].map(node => node.getAttribute('data-skill-id'))).toEqual([
     'babylon-js', 'lume', 'blender', 'openmotion-isometric-card-flight', 'openmotion-surreal-3d-poster',
   ]);
-  expect(container.querySelector('.om-specialty-feature')?.textContent).toContain('3D');
+  expect(banner.querySelector('.om-hero-actions button')?.textContent).toContain('3D');
   expect(button('Create a shot from this brief')).toBeUndefined();
-  await clickWorkspaceBack();
+  expect(container.querySelector('.om-skills-main .om-page-back-row')).toBeNull();
+  await traverse(-1);
   expect(page()).toMatchObject({ explore: true, community: '3d-motion', specialty: null, skill: null });
   expect(container.querySelector('.om-explore')).toBe(feed);
   expect(feed.scrollTop).toBe(326);
@@ -1905,6 +1905,7 @@ it('keeps the top-level Audio tab and Sound Studio home as independent navigatio
   expect(new URLSearchParams(location.search).has('home')).toBe(false);
   expect(button('Sound Studio').getAttribute('aria-current')).toBe('page');
   expect(button('Audio').getAttribute('aria-current')).toBeNull();
+  expect(container.querySelector('.om-creative-workspace .om-page-back-row')).toBeNull();
 });
 
 it.each([
@@ -1994,6 +1995,9 @@ it.each([
 ])('opens %s through %s in the unified editor without selecting a Skill', async (title, action, id, scene, tab) => {
   await mount();
   await click(title);
+  const banner = container.querySelector('.om-studio-landing-hero')!;
+  expect(banner.querySelector('h1')?.textContent).toBe(title);
+  expect([...banner.querySelectorAll('.om-hero-actions button')].map(item => item.textContent)).toContain(action);
   await click(action);
   expect(page()).toMatchObject({ studio: { landing: true, scene: { id: scene } }, specialty: null, skill: null });
   expect(location.pathname).toBe(`/create/${scene}`);
@@ -2050,7 +2054,8 @@ it.each(['text-to-video', 'image-to-video'])('shows Coming soon for a direct 3D 
   await click('3D Creative Skills');
   expect(page()).toMatchObject({ specialty: { id: '3d' }, skill: null });
   expect(container.querySelector('.om-studio-coming-soon')).toBeNull();
-  await clickWorkspaceBack();
+  expect(container.querySelector('.om-skills-main .om-page-back-row')).toBeNull();
+  await click('Explore');
   expect(page().explore).toBe(true);
 });
 
