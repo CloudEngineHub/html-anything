@@ -93,6 +93,7 @@ function mountOneTap(props: Partial<Parameters<typeof MotionGoogleOneTap>[0]> = 
     accountError: false,
     bfBannerVisible: false,
     refreshAccount: vi.fn(async () => {}),
+    pageAgeMs: () => 0,
     ...props,
   };
   act(() => {
@@ -129,7 +130,7 @@ it('skips Google One Tap completely inside the Electron desktop app', async () =
   expect(document.getElementById(ONETAP_ANCHOR_ID)).toBeNull();
 });
 
-it('delays 2000ms, loads fixed GIS URL, positions desktop anchor for Black Friday banner, and completes in-place login', async () => {
+it('prefetches the challenge and fixed GIS URL at once, prompts 2000ms after page entry, positions desktop anchor for Black Friday banner, and sends a Free account to Pricing after sign-in', async () => {
   expect(MOTION_ONETAP_DELAY_MS).toBe(2000);
   let initConfig: GoogleAccountsIdInitializeConfig | null = null;
   let promptListener: ((n: GooglePromptMomentNotification) => void) | undefined;
@@ -173,18 +174,16 @@ it('delays 2000ms, loads fixed GIS URL, positions desktop anchor for Black Frida
   const refreshAccount = vi.fn(async () => {});
   const accountChanged = vi.fn();
   window.addEventListener('motion:account-changed', accountChanged);
-
-  const { container } = mountOneTap({ bfBannerVisible: true, refreshAccount });
-
-  // Before 2500ms delay -> no challenge call yet
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(MOTION_ONETAP_DELAY_MS - 1);
+  const navigateToPricing = vi.fn((url: string) => {
+    expect(accountChanged).toHaveBeenCalledTimes(1);
+    expect(tracked.at(-1)?.event).toBe('onetap_login_success');
+    return url;
   });
-  expect(fetchSpy).not.toHaveBeenCalled();
 
-  // Trigger at 2500ms -> challenge fetched + GIS script appended with exact constant URL
+  const { container } = mountOneTap({ bfBannerVisible: true, refreshAccount, navigateToPricing, locale: 'zh-CN' });
+
+  // Immediately -> challenge fetched, then the GIS script appended with the exact constant URL once it succeeds
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(1);
     await Promise.resolve();
     await Promise.resolve();
   });
@@ -215,6 +214,16 @@ it('delays 2000ms, loads fixed GIS URL, positions desktop anchor for Black Frida
     await Promise.resolve();
   });
 
+  // Challenge and GIS are ready, but the prompt waits until the page is 2000ms old
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(MOTION_ONETAP_DELAY_MS - 1);
+  });
+  expect(initConfig).toBeNull();
+  expect(document.getElementById(ONETAP_ANCHOR_ID)).toBeNull();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+
   // Desktop anchor exists at top: 112px when Black Friday banner is visible
   const anchor = document.getElementById(ONETAP_ANCHOR_ID)!;
   expect(anchor).not.toBeNull();
@@ -229,6 +238,8 @@ it('delays 2000ms, loads fixed GIS URL, positions desktop anchor for Black Frida
         accountError={false}
         bfBannerVisible={false}
         refreshAccount={refreshAccount}
+        navigateToPricing={navigateToPricing}
+        locale="zh-CN"
       />,
     );
   });
@@ -247,17 +258,28 @@ it('delays 2000ms, loads fixed GIS URL, positions desktop anchor for Black Frida
   promptListener?.({ isDismissedMoment: () => true });
 
   // Trigger GIS credential callback -> POST /auth/one-tap -> refreshes account/summary + dispatches motion:account-changed
+  // -> Free account continues to Pricing through the signed-in upgrade handoff.
   await act(async () => {
     initConfig!.callback({ credential: 'jwt_google_token', select_by: 'user' });
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
   });
 
   expect(syncedIdentities).toEqual([{ signedIn: true, userId: 'usr_app_999' }]);
   expect(refreshAccount).toHaveBeenCalledTimes(1);
   expect(accountChanged).toHaveBeenCalledTimes(1);
   expect(document.getElementById(ONETAP_ANCHOR_ID)).toBeNull();
+  expect(navigateToPricing).toHaveBeenCalledTimes(1);
+  const pricingUrl = new URL(navigateToPricing.mock.calls[0][0]);
+  expect(pricingUrl.origin).toBe(window.location.origin);
+  expect(pricingUrl.pathname).toBe('/auth/upgrade-handoff');
+  expect(pricingUrl.searchParams.get('targetPath')).toBe('/zh/pricing');
+  expect(pricingUrl.searchParams.get('requireAuth')).toBe('1');
+  expect(pricingUrl.searchParams.get('expectedAppUserId')).toBe('usr_app_999');
+  expect(pricingUrl.searchParams.get('od_origin')).toBe('openmotion');
+  expect(pricingUrl.searchParams.get('od_entry_source')).toBe('openmotion_manage_subscription');
+  expect(pricingUrl.searchParams.get('od_entry_id')).toMatch(/^[0-9a-f-]{36}$/);
+  expect(pricingUrl.searchParams.get('utm_source')).toBe('openmotion');
+  expect(pricingUrl.searchParams.get('utm_medium')).toBe('onetap');
 
   // Verify every emitted event passes tracking registry validation
   const eventNames = tracked.map(item => item.event);
@@ -289,7 +311,7 @@ it('delays 2000ms, loads fixed GIS URL, positions desktop anchor for Black Frida
     surface: 'motion_web',
     is_new_user: true,
     plan_tier: 'free',
-    post_login_action: 'in_place',
+    post_login_action: 'redirect_pricing',
     ref: 'INVITE1',
     utm_source: 'twitter',
     utm_campaign: 'opengame',
@@ -297,6 +319,66 @@ it('delays 2000ms, loads fixed GIS URL, positions desktop anchor for Black Frida
 
   window.removeEventListener('motion:account-changed', accountChanged);
   expect(container).toBeTruthy();
+});
+
+it('prompts as soon as the challenge and GIS are ready when the page is already older than the entry delay', async () => {
+  const fetchSpy = vi.fn(async () =>
+    Response.json({
+      challengeId: 'otc_late',
+      nonce: 'nonce_late',
+      clientId: 'gid-late',
+      expiresAt: '2026-11-24T12:00:00.000Z',
+    }),
+  );
+  vi.stubGlobal('fetch', fetchSpy);
+  const initialize = vi.fn();
+  const prompt = vi.fn();
+
+  mountOneTap({ pageAgeMs: () => MOTION_ONETAP_DELAY_MS + 3000 });
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(fetchSpy).toHaveBeenCalledTimes(1);
+  const scriptEl = document.querySelector<HTMLScriptElement>(`script[src="${GOOGLE_GIS_SCRIPT_URL}"]`);
+  expect(scriptEl).not.toBeNull();
+
+  window.google = { accounts: { id: { initialize, prompt, disableAutoSelect: vi.fn(), cancel: vi.fn() } } };
+  await act(async () => {
+    scriptEl!.dispatchEvent(new Event('load'));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  // No timer advance needed: the page-entry delay has already elapsed
+  expect(initialize).toHaveBeenCalledWith(expect.objectContaining({ client_id: 'gid-late', nonce: 'nonce_late' }));
+  expect(prompt).toHaveBeenCalledTimes(1);
+});
+
+it('never requests the Google GIS script when the challenge is unavailable or rejected (404 not configured, 403 origin check)', async () => {
+  for (const status of [404, 403]) {
+    resetOneTapStateForTests();
+    const fetchSpy = vi.fn(async () =>
+      Response.json({ code: 'ONE_TAP_UNAVAILABLE', message: 'unavailable' }, { status }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    mountOneTap();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(MOTION_ONETAP_DELAY_MS + GOOGLE_GIS_LOAD_TIMEOUT_MS);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith('/auth/one-tap/challenge', expect.objectContaining({ method: 'POST' }));
+    expect(document.querySelector(`script[src="${GOOGLE_GIS_SCRIPT_URL}"]`)).toBeNull();
+    expect(document.getElementById(ONETAP_ANCHOR_ID)).toBeNull();
+    expect(tracked.some(entry => entry.event === 'onetap_prompt_observed')).toBe(false);
+
+    act(() => root?.unmount());
+    root = undefined;
+    tracked.length = 0;
+  }
 });
 
 it('omits prompt_parent_id on mobile viewports (< 768px) and reports script_load_failed on 5000ms timeout', async () => {
@@ -315,12 +397,11 @@ it('omits prompt_parent_id on mobile viewports (< 768px) and reports script_load
 
   mountOneTap();
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(MOTION_ONETAP_DELAY_MS);
     await Promise.resolve();
     await Promise.resolve();
   });
 
-  // Never dispatch 'load' on script -> still waiting at 4999ms, times out at 5000ms
+  // Never dispatch 'load' on script (requested at once) -> still waiting at 4999ms, times out at 5000ms
   await act(async () => {
     await vi.advanceTimersByTimeAsync(GOOGLE_GIS_LOAD_TIMEOUT_MS - 1);
     await Promise.resolve();
@@ -835,7 +916,8 @@ it('supports cross-tab logout cancellation and in-place retry with a fresh chall
 
   const onError = vi.fn();
   const refreshAccount = vi.fn(async () => {});
-  mountOneTap({ onError, refreshAccount });
+  const navigateToPricing = vi.fn();
+  mountOneTap({ onError, refreshAccount, navigateToPricing });
 
   await act(async () => {
     await vi.advanceTimersByTimeAsync(MOTION_ONETAP_DELAY_MS);
@@ -874,6 +956,15 @@ it('supports cross-tab logout cancellation and in-place retry with a fresh chall
   });
   expect(refreshAccount).toHaveBeenCalledTimes(1);
   expect(syncedIdentities.at(-1)).toEqual({ signedIn: true, userId: 'usr_app_retry' });
+  // Paid accounts stay signed in on the current page.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(navigateToPricing).not.toHaveBeenCalled();
+  expect(tracked.find(row => row.event === 'onetap_login_success')?.properties).toMatchObject({
+    plan_tier: 'plus',
+    post_login_action: 'in_place',
+  });
 
   // Cross-tab logout storage event cancels local runtime and disables auto-select
   window.dispatchEvent(
