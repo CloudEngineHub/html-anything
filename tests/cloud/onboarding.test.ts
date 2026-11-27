@@ -488,5 +488,27 @@ describe('Cloud install guide and stateless onboarding endpoints', () => {
     assert.ok(html.includes('查看详细权限标识 (7)'));
     assert.ok(html.includes('name="consent_token" value="tok-123"'));
     assert.ok(html.includes('value="approve"') && html.includes('value="deny"'));
+    assert.ok(!html.includes('ui-badge--warning'), 'loopback redirects need no host warning');
+  });
+
+  it('warns on the OAuth consent page only for unverified HTTPS redirect hosts', () => {
+    const render = (redirectUri: string, redirectHostVerified: boolean) =>
+      renderOAuthConsentHtml({
+        clientName: 'Doubao',
+        redirectUri,
+        redirectHostVerified,
+        workspaceName: 'Motion Team',
+        scopes: ['projects:read', 'mcp:tools'],
+        formAction: '/oauth/authorize',
+        hiddenFields: { consent_token: 'tok-123' },
+      });
+
+    const unverified = render('https://api.doubao-dev.com/api/oauth/v1/callback/personal/cb_ah_1', false);
+    assert.ok(unverified.includes('<span class="ui-badge ui-badge--warning">域名未验证</span>'));
+    assert.ok(unverified.includes('<b class="redirect-host">api.doubao-dev.com</b>'));
+
+    const verified = render('https://chatgpt.com/connector_platform_oauth_redirect', true);
+    assert.ok(!verified.includes('ui-badge--warning'));
+    assert.ok(verified.includes('回调至 chatgpt.com'));
   });
 });
