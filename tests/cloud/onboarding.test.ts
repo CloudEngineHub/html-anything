@@ -371,7 +371,7 @@ describe('Cloud install guide and stateless onboarding endpoints', () => {
 
   it('aligns shared/integration.ts cloud setup guide, OAuth login commands, and onboarding prompt', () => {
     const cloudInfo = buildCloudIntegrationInfo({
-      publicOrigin: 'https://motion.open-design.ai',
+      publicOrigin: 'https://app.open-design.ai',
       version: '1.0.0',
       workspaceId: 'ws-cloud',
       authMode: 'oidc',
@@ -380,15 +380,15 @@ describe('Cloud install guide and stateless onboarding endpoints', () => {
       tools: phase1Tools.map((t) => ({ name: t.name, description: t.description })),
     });
 
-    assert.equal(setupGuideUrl(cloudInfo), 'https://motion.open-design.ai/install.md');
+    assert.equal(setupGuideUrl(cloudInfo), 'https://app.open-design.ai/install.md');
     assert.match(manualConnection(cloudInfo, 'codex', 'en'), /codex mcp login openmotion/);
     assert.match(manualConnection(cloudInfo, 'claude', 'en'), /claude mcp login openmotion/);
     assert.ok(
       !integrationConfig(cloudInfo, 'codex').text.includes('bearer_token_env_var'),
       'OAuth-enabled cloud Codex config should not force a PAT env var',
     );
-    assert.ok(setupPrompt(cloudInfo, 'codex', 'zh-CN').includes('https://motion.open-design.ai/install.md'));
-    assert.ok(setupPrompt(cloudInfo, 'codex', 'en').includes('https://motion.open-design.ai/install.md'));
+    assert.ok(setupPrompt(cloudInfo, 'codex', 'zh-CN').includes('https://app.open-design.ai/install.md'));
+    assert.ok(setupPrompt(cloudInfo, 'codex', 'en').includes('https://app.open-design.ai/install.md'));
     assert.match(setupPrompt(cloudInfo, 'codex', 'zh-CN'), /本地 stdio 版 OpenMotion MCP/);
     assert.match(setupPrompt(cloudInfo, 'codex', 'en'), /legacy local stdio OpenMotion MCP server/);
     assert.match(projectAgentPrompt(cloudInfo, { id: 'proj-1', title: 'Launch Video' }, 'zh-CN'), /local stdio OpenMotion MCP/);
@@ -429,7 +429,7 @@ describe('Cloud install guide and stateless onboarding endpoints', () => {
       ),
     ];
     for (const output of handoffOutputs) {
-      assert.ok(output.includes('https://motion.open-design.ai/install.md'), `Missing /install.md in:\n${output}`);
+      assert.ok(output.includes('https://app.open-design.ai/install.md'), `Missing /install.md in:\n${output}`);
       assert.ok(!output.includes('/connect/guide'), `Unexpected legacy /connect/guide in:\n${output}`);
       assert.ok(!output.includes('/mcp-setup'), `Unexpected SPA /mcp-setup in:\n${output}`);
     }
