@@ -1213,7 +1213,7 @@ it.each([
     const header = container.querySelector('.om-studio-bar')!;
     expect(returnControl?.nextElementSibling).toBe(header.querySelector('h1'));
     expect(header.querySelector('h1')?.textContent).toBe('Create image');
-    expect([...header.querySelectorAll('nav button')].map(tab => tab.textContent)).toEqual(['Create image', 'Edit image', 'Remove background', 'Relight', 'Character reference']);
+    expect([...header.querySelectorAll('nav button')].map(tab => tab.textContent)).toEqual(['Create image', 'Edit image', 'Remove background', 'Relight']);
     expect(header.querySelector('[aria-current="page"]')?.textContent).toBe('Create image');
     expect(button('Image').getAttribute('aria-current')).toBe('location');
     expect(button('Design Studio').getAttribute('aria-current')).toBeNull();
@@ -1680,26 +1680,15 @@ it('lists each primary destination once in order, with the Image mega menu and t
   const menu = document.querySelector('.om-creative-menu-image')!;
   expect([...menu.querySelectorAll('.om-media-mega-columns h2')].map(node => node.textContent)).toEqual(['Features', 'Models']);
   const entryCards = [...menu.querySelectorAll<HTMLButtonElement>('.om-media-mega-entries > button')];
-  expect(entryCards.map(node => node.querySelector('strong')?.textContent)).toEqual(['Create image', 'Edit image', 'Character reference', '4K upscale']);
-  expect(entryCards[2].disabled).toBe(false);
-  expect(entryCards[2].textContent).not.toContain('Soon');
-  expect(entryCards[3].disabled).toBe(true);
-  expect(entryCards[3].textContent).toContain('Soon');
-  // Background removal and relighting are live features; 2K resolution stays a Create image option, not a standalone feature.
+  expect(entryCards.map(node => node.querySelector('strong')?.textContent)).toEqual(['Create image', 'Edit image', 'Remove background', 'Relight']);
+  expect(entryCards.every(card => !card.disabled)).toBe(true);
   expect(menu.textContent).not.toContain('2K HD output');
-  for (const label of ['Remove background', 'Relight']) {
-    const row = [...menu.querySelectorAll<HTMLButtonElement>('.om-media-mega-row')].find(node => node.textContent === label)!;
-    expect(row.disabled, label).toBe(false);
+  const imageFeatureRows = [...menu.querySelectorAll<HTMLButtonElement>('section[aria-label="Features"] .om-media-mega-row')];
+  expect(imageFeatureRows.map(row => row.querySelector('.om-media-mega-label')?.textContent)).toEqual(['4K upscale', 'Inpaint', 'Expand image', 'Batch', 'Image layers']);
+  for (const row of imageFeatureRows) {
+    expect(row.disabled).toBe(true);
+    expect(row.textContent).toContain('Soon');
   }
-  // Upcoming feature rows are visible with Soon (6 total features show directly without a 1-item More fold) and non-clickable.
-  const imageFeatureLabels = [...menu.querySelectorAll('section[aria-label="Features"] .om-media-mega-label')].map(node => node.textContent);
-  expect(imageFeatureLabels).not.toContain('4K upscale');
-  const inpainting = [...menu.querySelectorAll<HTMLButtonElement>('.om-media-mega-row')].find(node => node.textContent?.includes('Inpaint'))!;
-  expect(inpainting.disabled).toBe(true);
-  expect(inpainting.textContent).toContain('Soon');
-  expect(menu.textContent).toContain('Expand image');
-  expect(menu.textContent).toContain('Batch');
-  expect(menu.textContent).toContain('Image layers');
   expect(menu.querySelector('button[aria-label="More Features"]')).toBeNull();
   // The Models column lists every live gateway image model in flagship order (with More expanding beyond 5), without setup tags.
   const visibleModels = [...menu.querySelectorAll('section[aria-label="Models"] .om-media-mega-row .om-media-mega-label')].map(node => node.textContent);
@@ -1736,23 +1725,18 @@ it('lists each primary destination once in order, with the Image mega menu and t
   expect(videoHeader.querySelector('.om-studio-heading-icon')).toBeNull();
   expect(videoHeader.querySelector('nav button[aria-current="page"]')?.textContent).toBe('Multi-shot');
   expect(videoHeader.querySelectorAll('.om-video-scene-tab > svg')).toHaveLength(4);
-  // Character reference and the live feature rows open their own landing pages without a pinned model.
-  await openWorkspaceMenu('Image · Scenes');
-  const character = [...document.querySelectorAll<HTMLButtonElement>('.om-creative-menu-image .om-media-mega-entries > button')].find(node => node.querySelector('strong')?.textContent === 'Character reference')!;
-  await act(async () => character.click());
-  expect(page().studio).toMatchObject({ scene: { id: 'character' }, landing: true, model: null });
-  expect(container.querySelector('.om-studio-bar h1')?.textContent).toBe('Character reference');
+  // The live feature cards open their landing pages without a pinned model.
   for (const [label, scene] of [['Remove background', 'remove-background'], ['Relight', 'relight']]) {
     await openWorkspaceMenu('Image · Scenes');
-    const row = [...document.querySelectorAll<HTMLButtonElement>('.om-creative-menu-image .om-media-mega-row')].find(node => node.textContent === label)!;
-    await act(async () => row.click());
+    const card = [...document.querySelectorAll<HTMLButtonElement>('.om-creative-menu-image .om-media-mega-entries > button')].find(node => node.textContent === label)!;
+    await act(async () => card.click());
     expect(page().studio, label).toMatchObject({ scene: { id: scene }, landing: true, model: null });
     const header = container.querySelector('.om-studio-bar')!;
     expect(header.getAttribute('data-image-bar')).toBe('true');
     expect(header.querySelector('h1.sr-only')?.textContent).toBe(label);
     expect(header.querySelector('.om-studio-heading-icon')).toBeNull();
     expect(header.querySelector('nav button[aria-current="page"]')?.textContent).toBe(label);
-    expect(header.querySelectorAll('.om-image-scene-tab > svg')).toHaveLength(5);
+    expect(header.querySelectorAll('.om-image-scene-tab > svg')).toHaveLength(4);
   }
 });
 
@@ -2320,7 +2304,9 @@ it('shows the Explore shortcuts, fills two complete rows across Skills and techn
     expect(studioCards, studio).toHaveLength(expectedCount);
     expect(new Set(studioCards.map(card => card.dataset.playbackId)).size, studio).toBe(expectedCount);
   }
-  expect(container.querySelectorAll('.om-studio-collection[data-studio="image"] .om-scene-tile')).toHaveLength(7);
+  const imageCards = [...container.querySelectorAll('.om-studio-collection[data-studio="image"] .om-scene-tile')];
+  expect(imageCards).toHaveLength(6);
+  expect(imageCards.map(card => card.textContent)).not.toContain('Character reference');
   expect(container.querySelectorAll('.om-studio-collection[data-studio="cinema"] .om-scene-tile')).toHaveLength(4);
   expect(container.querySelectorAll('.om-studio-collection[data-studio="sound"] .om-scene-tile')).toHaveLength(2);
   const footer = container.querySelector('main.om-explore > footer.om-capability-index');
